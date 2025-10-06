@@ -12,10 +12,21 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
+    "@drift-labs/sdk": "^2.142.0-beta.8",
+    "@prisma/client": "^6.16.3",
+    "@privy-io/node": "^0.2.0",
+    "@privy-io/server-auth": "^1.32.5",
+    "@solana/spl-token": "^0.4.14",
+    "@solana/web3.js": "^1.98.4",
     "dotenv": "^17.2.2",
-    "node-telegram-bot-api": "^0.66.0"
+    "node-telegram-bot-api": "^0.66.0",
+    "prisma": "^6.16.3"
   },
   "devDependencies": {
-    "@types/node-telegram-bot-api": "^0.64.11"
+    "@types/node": "^20.0.0",
+    "@types/node-telegram-bot-api": "^0.64.11",
+    "nodemon": "^3.0.0",
+    "ts-node": "^10.9.0",
+    "typescript": "^5.0.0"
   }
 }

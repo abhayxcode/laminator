@@ -1,0 +1,388 @@
+// Laminator - Multi-DEX Perps Trading Bot Database Schema
+// Production-ready PostgreSQL schema with Prisma ORM
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ==============================================
+// ENUMS
+// ==============================================
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+  BANNED
+  PENDING_VERIFICATION
+}
+
+enum WalletType {
+  PRIVY
+  PHANTOM
+  SOLFLARE
+  BACKPACK
+  EXTERNAL
+}
+
+enum ChainType {
+  SOLANA
+  ETHEREUM
+  POLYGON
+}
+
+enum WalletStatus {
+  ACTIVE
+  INACTIVE
+  SUSPENDED
+  PENDING
+}
+
+enum MarketType {
+  PERPETUAL
+  SPOT
+  FUTURES
+}
+
+enum MarketStatus {
+  ACTIVE
+  INACTIVE
+  SUSPENDED
+  MAINTENANCE
+}
+
+enum OrderType {
+  MARKET
+  LIMIT
+  STOP
+  STOP_LIMIT
+}
+
+enum OrderSide {
+  BUY
+  SELL
+  LONG
+  SHORT
+}
+
+enum OrderStatus {
+  PENDING
+  OPEN
+  FILLED
+  PARTIALLY_FILLED
+  CANCELLED
+  EXPIRED
+  FAILED
+}
+
+enum PositionSide {
+  LONG
+  SHORT
+}
+
+enum PositionStatus {
+  OPEN
+  CLOSED
+  LIQUIDATED
+}
+
+enum TransactionType {
+  DEPOSIT
+  WITHDRAWAL
+  TRADE
+  FEE
+  REWARD
+  TRANSFER
+}
+
+enum TransactionStatus {
+  PENDING
+  CONFIRMED
+  FAILED
+  CANCELLED
+}
+
+enum AlertType {
+  PRICE_ABOVE
+  PRICE_BELOW
+  PRICE_CHANGE
+  VOLUME
+  POSITION_PNL
+}
+
+enum ConditionType {
+  GREATER_THAN
+  LESS_THAN
+  EQUALS
+  PERCENTAGE_CHANGE
+}
+
+enum AlertStatus {
+  ACTIVE
+  TRIGGERED
+  CANCELLED
+  EXPIRED
+}
+
+// ==============================================
+// MODELS
+// ==============================================
+
+model User {
+  id                String      @id @default(uuid())
+  telegramId        BigInt      @unique @map("telegram_id")
+  telegramUsername  String?     @map("telegram_username")
+  telegramFirstName String?     @map("telegram_first_name")
+  telegramLastName  String?     @map("telegram_last_name")
+  privyUserId       String?     @unique @map("privy_user_id")
+  status            UserStatus  @default(ACTIVE)
+  createdAt         DateTime    @default(now()) @map("created_at")
+  updatedAt         DateTime    @updatedAt @map("updated_at")
+  lastActive        DateTime    @default(now()) @map("last_active")
+  metadata          Json        @default("{}")
+
+  // Relations
+  wallets           Wallet[]
+  orders            Order[]
+  positions         Position[]
+  transactions      Transaction[]
+  alerts            Alert[]
+  userSettings      UserSetting[]
+  auditLogs         AuditLog[]
+
+  // Indexes
+  @@index([telegramId])
+  @@index([privyUserId])
+  @@index([status])
+  @@index([lastActive])
+  @@map("users")
+}
+
+model Wallet {
+  id              String       @id @default(uuid())
+  userId          String       @map("user_id")
+  privyWalletId   String?      @unique @map("privy_wallet_id")
+  walletAddress   String       @unique @map("wallet_address")
+  walletType      WalletType   @default(PRIVY) @map("wallet_type")
+  chainType       ChainType    @default(SOLANA) @map("chain_type")
+  status          WalletStatus @default(ACTIVE)
+  createdAt       DateTime     @default(now()) @map("created_at")
+  updatedAt       DateTime     @updatedAt @map("updated_at")
+  metadata        Json         @default("{}")
+
+  // Relations
+  user            User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  walletBalances  WalletBalance[]
+  orders          Order[]
+  positions       Position[]
+  transactions    Transaction[]
+
+  // Indexes
+  @@index([userId])
+  @@index([walletAddress])
+  @@index([privyWalletId])
+  @@map("wallets")
+}
+
+model WalletBalance {
+  id               String   @id @default(uuid())
+  walletId         String   @map("wallet_id")
+  tokenSymbol      String   @map("token_symbol")
+  tokenAddress     String?  @map("token_address")
+  balance          Decimal  @default(0) @db.Decimal(36, 18)
+  lockedBalance    Decimal  @default(0) @map("locked_balance") @db.Decimal(36, 18)
+  availableBalance Decimal  @map("available_balance") @db.Decimal(36, 18)
+  updatedAt        DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  wallet           Wallet   @relation(fields: [walletId], references: [id], onDelete: Cascade)
+
+  // Indexes
+  @@unique([walletId, tokenSymbol])
+  @@index([walletId, tokenSymbol])
+  @@index([updatedAt])
+  @@map("wallet_balances")
+}
+
+model Market {
+  id            String        @id @default(uuid())
+  symbol        String
+  baseAsset     String        @map("base_asset")
+  quoteAsset    String        @map("quote_asset")
+  dexName       String        @map("dex_name")
+  marketType    MarketType    @default(PERPETUAL) @map("market_type")
+  status        MarketStatus  @default(ACTIVE)
+  minOrderSize  Decimal?      @map("min_order_size") @db.Decimal(36, 18)
+  maxOrderSize  Decimal?      @map("max_order_size") @db.Decimal(36, 18)
+  tickSize      Decimal?      @map("tick_size") @db.Decimal(36, 18)
+  stepSize      Decimal?      @map("step_size") @db.Decimal(36, 18)
+  maxLeverage   Decimal?      @map("max_leverage") @db.Decimal(8, 2)
+  createdAt     DateTime      @default(now()) @map("created_at")
+  updatedAt     DateTime      @updatedAt @map("updated_at")
+
+  // Relations
+  orders        Order[]
+  positions     Position[]
+  alerts        Alert[]
+
+  @@unique([symbol, dexName])
+  @@map("markets")
+}
+
+model Order {
+  id            String      @id @default(uuid())
+  userId        String      @map("user_id")
+  walletId      String      @map("wallet_id")
+  marketId      String      @map("market_id")
+  orderType     OrderType   @map("order_type")
+  side          OrderSide
+  size          Decimal     @db.Decimal(36, 18)
+  price         Decimal?    @db.Decimal(36, 18)
+  leverage      Decimal     @default(1.0) @db.Decimal(8, 2)
+  status        OrderStatus @default(PENDING)
+  filledSize    Decimal     @default(0) @map("filled_size") @db.Decimal(36, 18)
+  avgFillPrice  Decimal?    @map("avg_fill_price") @db.Decimal(36, 18)
+  totalFees     Decimal     @default(0) @map("total_fees") @db.Decimal(36, 18)
+  createdAt     DateTime    @default(now()) @map("created_at")
+  updatedAt     DateTime    @updatedAt @map("updated_at")
+  expiresAt     DateTime?   @map("expires_at")
+
+  // Relations
+  user          User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  wallet        Wallet      @relation(fields: [walletId], references: [id], onDelete: Cascade)
+  market        Market      @relation(fields: [marketId], references: [id])
+
+  // Indexes
+  @@index([userId, status])
+  @@index([marketId, status])
+  @@index([createdAt])
+  @@index([expiresAt])
+  @@map("orders")
+}
+
+model Position {
+  id            String         @id @default(uuid())
+  userId        String         @map("user_id")
+  walletId      String         @map("wallet_id")
+  marketId      String         @map("market_id")
+  side          PositionSide
+  size          Decimal        @db.Decimal(36, 18)
+  entryPrice    Decimal        @map("entry_price") @db.Decimal(36, 18)
+  currentPrice  Decimal?       @map("current_price") @db.Decimal(36, 18)
+  leverage      Decimal        @default(1.0) @db.Decimal(8, 2)
+  margin        Decimal        @db.Decimal(36, 18)
+  unrealizedPnl Decimal        @default(0) @map("unrealized_pnl") @db.Decimal(36, 18)
+  realizedPnl   Decimal        @default(0) @map("realized_pnl") @db.Decimal(36, 18)
+  status        PositionStatus @default(OPEN)
+  openedAt      DateTime       @default(now()) @map("opened_at")
+  closedAt      DateTime?      @map("closed_at")
+  updatedAt     DateTime       @updatedAt @map("updated_at")
+
+  // Relations
+  user          User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  wallet        Wallet         @relation(fields: [walletId], references: [id], onDelete: Cascade)
+  market        Market         @relation(fields: [marketId], references: [id])
+
+  // Indexes
+  @@unique([userId, marketId, side])
+  @@index([userId, marketId])
+  @@index([status])
+  @@index([openedAt])
+  @@map("positions")
+}
+
+model Transaction {
+  id              String            @id @default(uuid())
+  userId          String            @map("user_id")
+  walletId        String            @map("wallet_id")
+  txHash          String?           @unique @map("tx_hash")
+  txType          TransactionType   @map("tx_type")
+  status          TransactionStatus @default(PENDING)
+  amount          Decimal?          @db.Decimal(36, 18)
+  tokenSymbol     String?           @map("token_symbol")
+  fromAddress     String?           @map("from_address")
+  toAddress       String?           @map("to_address")
+  gasFee          Decimal?          @map("gas_fee") @db.Decimal(36, 18)
+  blockNumber     BigInt?           @map("block_number")
+  blockTimestamp  DateTime?         @map("block_timestamp")
+  createdAt       DateTime          @default(now()) @map("created_at")
+  updatedAt       DateTime          @updatedAt @map("updated_at")
+  metadata        Json              @default("{}")
+
+  // Relations
+  user            User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  wallet          Wallet            @relation(fields: [walletId], references: [id], onDelete: Cascade)
+
+  // Indexes
+  @@index([userId, createdAt])
+  @@index([walletId, txType])
+  @@index([txHash])
+  @@index([status])
+  @@map("transactions")
+}
+
+model Alert {
+  id              String      @id @default(uuid())
+  userId          String      @map("user_id")
+  marketId        String?     @map("market_id")
+  alertType       AlertType   @map("alert_type")
+  conditionType   ConditionType @map("condition_type")
+  targetPrice     Decimal?    @map("target_price") @db.Decimal(36, 18)
+  targetPercentage Decimal?   @map("target_percentage") @db.Decimal(8, 4)
+  message         String?
+  status          AlertStatus @default(ACTIVE)
+  triggeredAt     DateTime?   @map("triggered_at")
+  createdAt       DateTime    @default(now()) @map("created_at")
+
+  // Relations
+  user            User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  market          Market?     @relation(fields: [marketId], references: [id])
+
+  // Indexes
+  @@index([userId])
+  @@index([marketId])
+  @@index([status])
+  @@index([alertType])
+  @@map("alerts")
+}
+
+model UserSetting {
+  id           String   @id @default(uuid())
+  userId       String   @map("user_id")
+  settingKey   String   @map("setting_key")
+  settingValue Json     @map("setting_value")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, settingKey])
+  @@map("user_settings")
+}
+
+model AuditLog {
+  id           String   @id @default(uuid())
+  userId       String?  @map("user_id")
+  action       String
+  resourceType String   @map("resource_type")
+  resourceId   String?  @map("resource_id")
+  oldValues    Json?    @map("old_values")
+  newValues    Json?    @map("new_values")
+  ipAddress    String?  @map("ip_address")
+  userAgent    String?  @map("user_agent")
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  // Relations
+  user         User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  // Indexes
+  @@index([userId, action])
+  @@index([resourceType, resourceId])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
