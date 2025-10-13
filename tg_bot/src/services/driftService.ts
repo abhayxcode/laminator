@@ -31,9 +31,11 @@ import {
   Connection as SolanaConnection, 
   PublicKey as SolanaPublicKey,
   Keypair,
-  clusterApiUrl
+  clusterApiUrl,
+  LAMPORTS_PER_SOL
 } from '@solana/web3.js';
 import { privyService } from './privyService';
+import { databaseService } from './databaseService';
 
 // Simplified interfaces for the bot
 export interface PerpMarket {
@@ -801,27 +803,99 @@ export class DriftService {
     }
 
     try {
-      console.log(`💰 Fetching balance for Telegram user: ${telegramUserId}`);
-      
-      // Get Drift client with user's Privy wallet
+      console.log(`💰 Fetching on-chain USDC balance for Telegram user: ${telegramUserId}`);
+
+      // Get user's primary wallet address from database
+      const dbUser = await databaseService.getUserByTelegramId(telegramUserId);
+      const walletAddress: string | undefined = dbUser?.wallets?.[0]?.walletAddress;
+      if (!walletAddress) {
+        throw new Error('User wallet address not found in database');
+      }
+
+      // Mainnet USDC mint (can be overridden via env)
+      const usdcMint = process.env.USDC_MINT || 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
+
+      const ownerPubkey = new SolanaPublicKey(walletAddress);
+      const mintPubkey = new SolanaPublicKey(usdcMint);
+
+      // Fetch all token accounts for USDC mint owned by this wallet
+      const resp = await this.connection.getParsedTokenAccountsByOwner(
+        ownerPubkey,
+        { mint: mintPubkey },
+        'confirmed'
+      );
+
+      let totalUsdc = 0;
+      for (const { account } of resp.value) {
+        const info: any = account.data.parsed?.info;
+        const uiAmount = info?.tokenAmount?.uiAmount;
+        if (typeof uiAmount === 'number') {
+          totalUsdc += uiAmount;
+        }
+      }
+
+      console.log(`✅ On-chain USDC balance for ${walletAddress}: ${totalUsdc.toFixed(6)} USDC`);
+      return totalUsdc;
+    } catch (error) {
+      console.error('❌ Failed to fetch on-chain USDC balance:', error);
+      throw error;
+    }
+  }
+
+  async getOnchainSolBalance(telegramUserId: number): Promise<number> {
+    if (!this.initialized) {
+      throw new Error('Drift service not initialized');
+    }
+
+    try {
+      const dbUser = await databaseService.getUserByTelegramId(telegramUserId);
+      const walletAddress: string | undefined = dbUser?.wallets?.[0]?.walletAddress;
+      if (!walletAddress) {
+        throw new Error('User wallet address not found in database');
+      }
+
+      const ownerPubkey = new SolanaPublicKey(walletAddress);
+      const lamports = await this.connection.getBalance(ownerPubkey, 'confirmed');
+      return lamports / LAMPORTS_PER_SOL;
+    } catch (error) {
+      console.error('❌ Failed to fetch on-chain SOL balance:', error);
+      throw error;
+    }
+  }
+
+  async getDriftCollateralUSDC(telegramUserId: number): Promise<number> {
+    if (!this.initialized) {
+      throw new Error('Drift service not initialized');
+    }
+
+    try {
       const driftClient = await this.getDriftClientForUser(telegramUserId);
-      
-      // Get user account from Drift
       const userAccount = driftClient.getUserAccount();
       if (!userAccount) {
-        console.log('No user account found in Drift');
         return 0;
       }
-      
-      // Calculate total collateral (simplified)
-      // Note: This is a placeholder - actual collateral calculation would require more complex logic
-      const balance = 1250.75; // Mock balance for now - will be replaced with real calculation
 
-      console.log(`✅ User balance: ${balance} USDC`);
-      return balance;
+      // Approximate total collateral in USDC by summing spot positions balances with USDC price=1
+      // This is a simplified representation suitable for display.
+      let totalUSDC = 0;
+      try {
+        const spotMarkets = driftClient.getSpotMarketAccounts();
+        for (const spotMarket of spotMarkets) {
+          const pos = driftClient.getSpotPosition ? driftClient.getSpotPosition(spotMarket.marketIndex) : null;
+          if (pos && pos.scaledBalance && !pos.scaledBalance.isZero()) {
+            const bal = convertToNumber(pos.scaledBalance, spotMarket.decimals);
+            // Treat all as USDC-equivalent for a conservative estimate; refine per-market pricing if needed
+            totalUSDC += bal;
+          }
+        }
+      } catch (e) {
+        console.warn('⚠️ Failed to enumerate spot positions for collateral calc:', e);
+      }
+
+      return Math.max(0, totalUSDC);
     } catch (error) {
-      console.error('❌ Failed to get user balance:', error);
-      throw error;
+      console.error('❌ Failed to compute Drift collateral:', error);
+      return 0;
     }
   }
 

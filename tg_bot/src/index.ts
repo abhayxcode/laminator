@@ -1,34 +1,34 @@
 import { bot } from "./bot";
 import { safeReply } from "./helper";
-import { DriftService } from "./services/driftService";
+// Removed direct DriftService usage; use dexManager instead
 import { userService } from "./services/userService";
 import { privyService } from "./services/privyService";
 import { databaseService } from "./services/databaseService";
+import { dexManager } from "./services/dexManager";
 
 // Initialize services
-const driftService = new DriftService();
-let driftInitialized = false;
+let dexManagerInitialized = false;
 let databaseInitialized = false;
 
 // Initialize services on startup
 Promise.all([
-  driftService.initialize(),
+  dexManager.initialize(),
   databaseService.initialize().catch((dbError) => {
     console.warn('⚠️ Database not available, continuing without database:', dbError.message);
     return Promise.resolve(); // Continue without database
   })
 ]).then(() => {
-  driftInitialized = true;
+  dexManagerInitialized = true;
   databaseInitialized = true;
   console.log('✅ All services initialized (database optional)');
 }).catch((error) => {
   console.error('❌ Failed to initialize services:', error);
-  // Still try to initialize drift service
-  driftService.initialize().then(() => {
-    driftInitialized = true;
-    console.log('✅ Drift service initialized (database unavailable)');
-  }).catch((driftError) => {
-    console.error('❌ Failed to initialize Drift service:', driftError);
+  // Still try to initialize DEX manager
+  dexManager.initialize().then(() => {
+    dexManagerInitialized = true;
+    console.log('✅ DEX Manager initialized (database unavailable)');
+  }).catch((dexError) => {
+    console.error('❌ Failed to initialize DEX Manager:', dexError);
   });
 });
 
@@ -70,7 +70,9 @@ bot.onText(/^\/start$/, async (msg) => {
       message += `**After wallet creation, you can:**\n`;
       message += `• \`/wallet\` - Wallet management\n`;
       message += `• \`/balance\` - Check balance\n`;
-      message += `• \`/dexs\` - Browse markets\n`;
+      message += `• \`/dexs\` - Browse all DEXs\n`;
+      message += `• \`/dexdrift\` - Browse Drift Protocol\n`;
+      message += `• \`/dexjupiter\` - Browse Jupiter Perps\n`;
       message += `• \`/status\` - System status\n\n`;
       message += `💡 **Privy wallets are:**\n`;
       message += `• 🔐 Secure MPC wallets\n`;
@@ -81,14 +83,18 @@ bot.onText(/^\/start$/, async (msg) => {
       message += `**Available Commands:**\n`;
       message += `• \`/wallet\` - Wallet management hub\n`;
       message += `• \`/balance\` - Show your balance\n`;
-      message += `• \`/dexs\` - Browse perpetual markets\n`;
+      message += `• \`/dexs\` - Browse all DEXs\n`;
+      message += `• \`/dexdrift\` - Browse Drift Protocol\n`;
+      message += `• \`/dexjupiter\` - Browse Jupiter Perps\n`;
       message += `• \`/orderbook <symbol>\` - Market data\n`;
       message += `• \`/myposition\` - View positions\n`;
       message += `• \`/open <symbol> <size> <side>\` - Open position\n`;
       message += `• \`/close <symbol>\` - Close position\n`;
       message += `• \`/status\` - System status\n\n`;
       message += `**Example Usage:**\n`;
-      message += `\`/dexs\` - List all markets\n`;
+      message += `\`/dexs\` - List all DEXs\n`;
+      message += `\`/dexdrift\` - Browse Drift Protocol\n`;
+      message += `\`/dexjupiter\` - Browse Jupiter Perps\n`;
       message += `\`/open SOL 1 long\` - Open 1 SOL long position\n`;
       message += `\`/orderbook SOL\` - View SOL orderbook`;
     }
@@ -100,26 +106,72 @@ bot.onText(/^\/start$/, async (msg) => {
   }
 });
 
-// /dexs - Show available markets
+// /dexs - Show available DEXs
 bot.onText(/^\/dexs$/, async (msg) => {
   const chatId = msg.chat.id;
   
-  if (!driftInitialized) {
-    await safeReply(chatId, "⏳ Drift service is initializing, please wait...");
+  if (!dexManagerInitialized) {
+    await safeReply(chatId, "⏳ DEX services are initializing, please wait...");
     return;
   }
 
   try {
-    await safeReply(chatId, "📊 Fetching available markets...");
+    await safeReply(chatId, "📊 Fetching available DEXs...");
     
-    const markets = await driftService.getAvailableMarkets();
+    const dexes = dexManager.getAvailableDEXs();
     
-    if (markets.length === 0) {
-      await safeReply(chatId, "❌ No markets found");
+    if (dexes.length === 0) {
+      await safeReply(chatId, "❌ No DEXs found");
       return;
     }
 
-    let message = "⚡ **Laminator - Available Perpetual Markets:**\n\n";
+    let message = "⚡ **Laminator - Available DEXs:**\n\n";
+    
+    dexes.forEach((dex, index) => {
+      message += `${index + 1}. **${dex.name}**\n`;
+      message += `   📝 ${dex.description}\n`;
+      if (dex.isActive) {
+        message += `   📊 Markets: ${dex.marketsCount}\n`;
+        message += `   💰 24h Volume: $${(dex.volume24h / 1000000).toFixed(1)}M\n`;
+        message += `   🎯 Command: \`/dex${dex.id}\`\n`;
+      } else {
+        message += `   🚧 **Coming Soon**\n`;
+      }
+      message += `\n`;
+    });
+
+    message += "💡 **Usage:**\n";
+    message += "• `/dexdrift` - Browse Drift Protocol markets\n";
+    message += "• `/dexjupiter` - Browse Jupiter Perps markets\n";
+    message += "• `/orderbook <symbol>` - View market details\n";
+
+    await safeReply(chatId, message);
+  } catch (error) {
+    console.error('Error fetching DEXs:', error);
+    await safeReply(chatId, "❌ Failed to fetch DEXs. Please try again later.");
+  }
+});
+
+// /dexdrift - Show Drift Protocol markets
+bot.onText(/^\/dexdrift$/, async (msg) => {
+  const chatId = msg.chat.id;
+  
+  if (!dexManagerInitialized) {
+    await safeReply(chatId, "⏳ DEX services are initializing, please wait...");
+    return;
+  }
+
+  try {
+    await safeReply(chatId, "📊 Fetching Drift Protocol markets...");
+    
+    const markets = await dexManager.getMarketsForDEX('drift');
+    
+    if (markets.length === 0) {
+      await safeReply(chatId, "❌ No Drift Protocol markets found");
+      return;
+    }
+
+    let message = "⚡ **Drift Protocol - Available Markets:**\n\n";
     
     // Check if we're using Helius/Drift Protocol data
     const isUsingHelius = process.env.HELIUS_API_KEY;
@@ -140,12 +192,46 @@ bot.onText(/^\/dexs$/, async (msg) => {
       message += `... and ${markets.length - 10} more markets\n`;
     }
 
-    message += "\n💡 Use `/orderbook <symbol>` to view market details";
+    message += "\n💡 **Usage:**\n";
+    message += "• `/orderbook <symbol>` - View market details\n";
+    message += "• `/dexjupiter` - Browse Jupiter Perps\n";
+    message += "• `/dexs` - Back to all DEXs\n";
 
     await safeReply(chatId, message);
   } catch (error) {
-    console.error('Error fetching markets:', error);
-    await safeReply(chatId, "❌ Failed to fetch markets. Please try again later.");
+    console.error('Error fetching Drift markets:', error);
+    await safeReply(chatId, "❌ Failed to fetch Drift Protocol markets. Please try again later.");
+  }
+});
+
+// /dexjupiter - Show Jupiter Perps markets
+bot.onText(/^\/dexjupiter$/, async (msg) => {
+  const chatId = msg.chat.id;
+  
+  if (!dexManagerInitialized) {
+    await safeReply(chatId, "⏳ DEX services are initializing, please wait...");
+    return;
+  }
+
+  try {
+    let message = "⚡ **Jupiter Perps - Coming Soon**\n\n";
+    message += "🚀 **Jupiter Aggregator Integration**\n\n";
+    message += "🚧 **Status:** Under Development\n\n";
+    message += "**What's Coming:**\n";
+    message += "• 📊 Jupiter Perps markets\n";
+    message += "• 📈 Real-time orderbook data\n";
+    message += "• 💰 Balance and position tracking\n";
+    message += "• 🎯 Seamless trading integration\n\n";
+    message += "**Available Now:**\n";
+    message += "• `/dexdrift` - Browse Drift Protocol (79 markets)\n";
+    message += "• `/orderbook <symbol>` - View Drift markets\n";
+    message += "• `/dexs` - Back to all DEXs\n\n";
+    message += "💡 **Stay tuned for updates!**";
+
+    await safeReply(chatId, message);
+  } catch (error) {
+    console.error('Error showing Jupiter coming soon:', error);
+    await safeReply(chatId, "❌ Failed to load Jupiter Perps information. Please try again later.");
   }
 });
 
@@ -154,6 +240,10 @@ bot.onText(/^\/balance$/, async (msg) => {
   const chatId = msg.chat.id;
   
   try {
+    if (!databaseInitialized) {
+      await safeReply(chatId, "⏳ Database is initializing, please try again in a moment...");
+      return;
+    }
     // Get user from database
     const user = await databaseService.getUserByTelegramId(chatId);
     
@@ -169,8 +259,8 @@ bot.onText(/^\/balance$/, async (msg) => {
       return;
     }
 
-    if (!driftInitialized) {
-      await safeReply(chatId, "⏳ Drift service is initializing, please wait...");
+    if (!dexManagerInitialized) {
+      await safeReply(chatId, "⏳ DEX services are initializing, please wait...");
       return;
     }
 
@@ -180,17 +270,20 @@ bot.onText(/^\/balance$/, async (msg) => {
     message += `🔑 **Wallet:** \`${wallet.walletAddress}\`\n\n`;
     
     try {
-      // Get real balance from Drift Protocol via Privy wallet
-      const driftBalance = await driftService.getUserBalance(chatId);
+      // On-chain wallet balances (real-time)
+      const walletUsdc = await dexManager.getWalletUsdcBalance(chatId);
+
+      // Drift collateral (funds deposited into Drift)
+      const driftCollateral = await dexManager.getDexCollateral('drift', chatId);
+
+      // On-chain SOL balance via dexManager (RPC)
+      const walletSolResolved = await dexManager.getWalletSolBalance(chatId);
+
+      message += `💰 **Wallet USDC:** ${walletUsdc.toFixed(2)} USDC\n`;
+      message += `💰 **Wallet SOL:** ${walletSolResolved.toFixed(4)} SOL\n`;
+      message += `🏦 **Drift Collateral:** ${driftCollateral.toFixed(2)} USDC\n\n`;
       
-      // Also get database balances for SOL
-      const balances = await databaseService.getAllWalletBalances(wallet.id);
-      const solBalance = balances.find(b => b.tokenSymbol === 'SOL')?.balance || 0;
-      
-      message += `💰 **Drift Balance:** ${driftBalance.toFixed(2)} USDC\n`;
-      message += `💰 **SOL Balance:** ${solBalance.toFixed(4)} SOL\n\n`;
-      
-      if (driftBalance > 0 || solBalance > 0) {
+      if (walletUsdc > 0 || walletSolResolved > 0 || driftCollateral > 0) {
         message += "✅ **Ready for Trading**\n";
         message += "• Use `/dexs` to browse markets\n";
         message += "• Use `/open` to place trades\n";
@@ -242,38 +335,48 @@ bot.onText(/^\/balance$/, async (msg) => {
 bot.onText(/^\/orderbook(.*)$/, async (msg, match) => {
   const chatId = msg.chat.id;
   
-  // If no symbol provided, show available markets
+  // If no symbol provided, show available DEXs
   if (!match || !match[1] || match[1].trim() === '') {
     try {
-      if (!driftInitialized) {
-        await safeReply(chatId, "⏳ Drift service is initializing, please wait...");
+      if (!dexManagerInitialized) {
+        await safeReply(chatId, "⏳ DEX services are initializing, please wait...");
         return;
       }
 
-      await safeReply(chatId, "📊 Fetching available markets...");
-      const markets = await driftService.getAvailableMarkets();
+      await safeReply(chatId, "📊 Fetching available DEXs...");
+      const dexes = dexManager.getAvailableDEXs();
       
-      if (markets.length === 0) {
-        await safeReply(chatId, "❌ No markets found");
+      if (dexes.length === 0) {
+        await safeReply(chatId, "❌ No DEXs found");
         return;
       }
 
-      let message = "⚡ **Available Markets for Orderbook:**\n\n";
-      markets.slice(0, 10).forEach((market, index) => {
-        message += `${index + 1}. **${market.symbol}** - $${market.price.toFixed(4)}\n`;
-      });
+      let message = "⚡ **Available DEXs for Orderbook:**\n\n";
+    dexes.forEach((dex, index) => {
+      message += `${index + 1}. **${dex.name}**\n`;
+      if (dex.isActive) {
+        message += `   📊 ${dex.marketsCount} markets available\n`;
+        message += `   🎯 Use \`/dex${dex.id}\` to browse\n`;
+      } else {
+        message += `   🚧 **Coming Soon**\n`;
+      }
+      message += `\n`;
+    });
 
-      message += "\n💡 **Usage:** `/orderbook <symbol>`\n";
+      message += "💡 **Usage:** `/orderbook <symbol>`\n";
       message += "**Examples:**\n";
-      message += "• `/orderbook SOL`\n";
+      message += "• `/orderbook SOL` (tries Drift first, then Jupiter)\n";
       message += "• `/orderbook BTC`\n";
-      message += "• `/orderbook ETH`";
+      message += "• `/orderbook RAY` (Jupiter-specific)\n\n";
+      message += "**DEX Commands:**\n";
+      message += "• `/dexdrift` - Browse Drift Protocol\n";
+      message += "• `/dexjupiter` - Browse Jupiter Perps\n";
 
       await safeReply(chatId, message);
       return;
     } catch (error) {
-      console.error('Error fetching markets:', error);
-      await safeReply(chatId, "❌ Failed to fetch markets. Please try again later.");
+      console.error('Error fetching DEXs:', error);
+      await safeReply(chatId, "❌ Failed to fetch DEXs. Please try again later.");
       return;
     }
   }
@@ -281,29 +384,58 @@ bot.onText(/^\/orderbook(.*)$/, async (msg, match) => {
   const symbol = match[1].trim().toUpperCase();
   
   try {
-    console.log(`🔍 Getting orderbook for ${symbol}`);
+    console.log(`🔍 Getting orderbook for ${symbol} across all DEXs`);
     await safeReply(chatId, `🔍 Fetching orderbook for ${symbol}...`);
     
-    const orderbook = await driftService.getOrderbook(symbol);
-    console.log(`📊 Orderbook result:`, orderbook ? 'Success' : 'Failed');
+    let orderbook = null;
+    let dexName = '';
+    let dexId = '';
     
-          if (!orderbook) {
-            await safeReply(chatId, `❌ Real orderbook data not available for ${symbol}\n\n💡 **Issue:** Your Helius API key is on the free tier\n\n🔧 **Solution:** Upgrade to Helius paid plan for batch requests support\n\n📊 **Current Status:** Using CoinGecko for market prices only\n\n💡 **Note:** The bot still works for market prices, just not real-time orderbook data`);
-            return;
-          }
+    // Try Drift Protocol first (most markets)
+    try {
+      orderbook = await dexManager.getOrderbookForDEX('drift', symbol);
+      if (orderbook) {
+        dexName = orderbook.dexName;
+        dexId = orderbook.dexId;
+      }
+    } catch (driftError) {
+      console.log(`⚠️ Drift orderbook failed for ${symbol}:`, driftError);
+    }
+    
+    // If Drift fails, try Jupiter
+    if (!orderbook) {
+      try {
+        orderbook = await dexManager.getOrderbookForDEX('jupiter', symbol);
+        if (orderbook) {
+          dexName = orderbook.dexName;
+          dexId = orderbook.dexId;
+        }
+      } catch (jupiterError) {
+        console.log(`⚠️ Jupiter orderbook failed for ${symbol}:`, jupiterError);
+      }
+    }
+    
+    console.log(`📊 Orderbook result:`, orderbook ? `Success from ${dexName}` : 'Failed on all DEXs');
+    
+    if (!orderbook) {
+      await safeReply(chatId, `❌ Orderbook data not available for ${symbol}\n\n💡 **Available DEXs:**\n• Drift Protocol (79 markets) - ✅ Active\n• Jupiter Perps - 🚧 Coming Soon\n\n🎯 **Try:**\n• \`/dexdrift\` - Browse Drift markets\n• \`/dexjupiter\` - See Jupiter preview\n• \`/dexs\` - View all DEXs`);
+      return;
+    }
 
-    // Check if we're using real Drift Protocol data
+    // Determine data source and display accordingly
+    const isDrift = dexId === 'drift';
     const hasHeliusKey = process.env.HELIUS_API_KEY && 
                         process.env.HELIUS_API_KEY !== 'your_helius_key_here' &&
                         process.env.HELIUS_API_KEY.length > 10;
-    const isUsingHelius = hasHeliusKey;
     
     let message = `⚡ **Laminator - ${symbol} Orderbook**\n\n`;
     
-    if (isUsingHelius) {
+    if (isDrift && hasHeliusKey) {
       message += "🔥 **Real Drift Protocol Orderbook** (via Helius RPC)\n\n";
+    } else if (isDrift) {
+      message += "📊 **Drift Protocol Data** (fallback mode)\n\n";
     } else {
-      message += "📊 **Market Data** (fallback mode)\n\n";
+      message += `🚀 **${dexName} Data**\n\n`;
     }
     
     message += `💰 **Last Price:** $${orderbook.lastPrice.toFixed(4)}\n\n`;
@@ -409,9 +541,9 @@ bot.onText(/^\/open (.+)$/, async (msg, match) => {
       return;
     }
 
-    // Try to open position using DriftService with Privy wallet
+    // Try to open position using DEX Manager (Drift)
     try {
-      const txHash = await driftService.openPosition(chatId, symbolUpper, size, side.toLowerCase() as 'long' | 'short');
+      const txHash = await dexManager.openPositionForDEX('drift', chatId, symbolUpper, size, side.toLowerCase() as 'long' | 'short');
       
       await safeReply(chatId, `🎯 **Position Opening Initiated!**\n\n**Details:**\n• Symbol: ${symbolUpper}\n• Side: ${side.toUpperCase()}\n• Size: ${size}\n• Transaction: \`${txHash}\`\n\n⚠️ **Note:** Transaction signing with Privy integration is ready but transaction building is still in development.\n\n✅ **Status:**\n• ✅ Wallet connected\n• ✅ Market validated\n• ✅ Privy integration ready\n• ⏳ Transaction building (coming soon)`);
     } catch (error) {
@@ -451,7 +583,7 @@ bot.onText(/^\/close (.+)$/, async (msg, match) => {
 
     const symbol = match[1].toUpperCase();
     try {
-      const txHash = await driftService.closePosition(chatId, symbol);
+      const txHash = await dexManager.closePositionForDEX('drift', chatId, symbol);
       
       await safeReply(chatId, `🔒 **Position Closing Initiated!**\n\n**Details:**\n• Symbol: ${symbol}\n• Transaction: \`${txHash}\`\n\n⚠️ **Note:** Transaction signing with Privy integration is ready but transaction building is still in development.\n\n✅ **Status:**\n• ✅ Wallet connected\n• ✅ Position found\n• ✅ Privy integration ready\n• ⏳ Transaction building (coming soon)`);
     } catch (error) {
@@ -491,14 +623,14 @@ bot.onText(/^\/myposition$/, async (msg) => {
       return;
     }
 
-    if (!driftInitialized) {
+    if (!dexManagerInitialized) {
       await safeReply(chatId, "⏳ Drift service is initializing, please wait...");
       return;
     }
 
     try {
-      // Get positions from Drift Protocol via Privy wallet
-      const driftPositions = await driftService.getUserPositions(chatId);
+      // Get positions from Drift Protocol via DEX Manager
+      const driftPositions = await dexManager.getUserPositionsForDEX('drift', chatId);
       
       if (driftPositions.length === 0) {
         await safeReply(chatId, "📭 **No open positions found**\n\nUse `/dexs` to browse markets and `/open` to place trades.");
@@ -739,7 +871,7 @@ bot.onText(/^\/status$/, async (msg) => {
     }
     
     message += "\n**📊 Service Status:**\n";
-    message += `• Drift Protocol: ${driftInitialized ? '✅' : '❌'}\n`;
+    message += `• DEX Manager: ${dexManagerInitialized ? '✅' : '❌'}\n`;
     message += `• Database: ${databaseInitialized ? '✅' : '❌'}\n`;
     message += `• Privy Integration: ✅\n`;
     message += `• Bot Status: ✅ Active`;
