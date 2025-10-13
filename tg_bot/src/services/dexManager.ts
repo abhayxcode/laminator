@@ -127,9 +127,9 @@ export class DEXManager {
       {
         id: 'jupiter',
         name: 'Jupiter Perps',
-        description: 'Jupiter aggregator for perpetual trading - Coming Soon',
-        isActive: false,
-        marketsCount: 0,
+        description: 'Jupiter aggregator spot/route data via price.jup.ag',
+        isActive: true,
+        marketsCount: 25,
         volume24h: 0,
       },
     ];

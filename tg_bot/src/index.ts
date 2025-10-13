@@ -214,24 +214,38 @@ bot.onText(/^\/dexjupiter$/, async (msg) => {
   }
 
   try {
-    let message = "⚡ **Jupiter Perps - Coming Soon**\n\n";
-    message += "🚀 **Jupiter Aggregator Integration**\n\n";
-    message += "🚧 **Status:** Under Development\n\n";
-    message += "**What's Coming:**\n";
-    message += "• 📊 Jupiter Perps markets\n";
-    message += "• 📈 Real-time orderbook data\n";
-    message += "• 💰 Balance and position tracking\n";
-    message += "• 🎯 Seamless trading integration\n\n";
-    message += "**Available Now:**\n";
-    message += "• `/dexdrift` - Browse Drift Protocol (79 markets)\n";
-    message += "• `/orderbook <symbol>` - View Drift markets\n";
-    message += "• `/dexs` - Back to all DEXs\n\n";
-    message += "💡 **Stay tuned for updates!**";
+    await safeReply(chatId, "📊 Fetching Jupiter markets...");
+
+    const markets = await dexManager.getMarketsForDEX('jupiter');
+
+    if (!markets || markets.length === 0) {
+      await safeReply(chatId, "❌ No Jupiter markets found");
+      return;
+    }
+
+    let message = "⚡ **Jupiter - Available Markets (via Aggregator)**\n\n";
+    message += "🔥 **Real-Time Prices** (price.jup.ag)\n\n";
+
+    markets.slice(0, 10).forEach((market, index) => {
+      message += `${index + 1}. **${market.symbol}**\n`;
+      message += `   💰 Price: $${market.price.toFixed(6)}\n`;
+      message += `   📈 24h: ${market.change24h.toFixed(2)}%\n`;
+      message += `   📊 Volume: $${market.volume24h.toLocaleString()}\n\n`;
+    });
+
+    if (markets.length > 10) {
+      message += `... and ${markets.length - 10} more markets\n`;
+    }
+
+    message += "\n💡 **Usage:**\n";
+    message += "• `/orderbook <symbol>` - View market details (tries Drift, then Jupiter)\n";
+    message += "• `/dexdrift` - Browse Drift Protocol\n";
+    message += "• `/dexs` - Back to all DEXs";
 
     await safeReply(chatId, message);
   } catch (error) {
-    console.error('Error showing Jupiter coming soon:', error);
-    await safeReply(chatId, "❌ Failed to load Jupiter Perps information. Please try again later.");
+    console.error('Error fetching Jupiter markets:', error);
+    await safeReply(chatId, "❌ Failed to fetch Jupiter markets. Please try again later.");
   }
 });
 
