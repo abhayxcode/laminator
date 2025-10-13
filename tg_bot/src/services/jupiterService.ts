@@ -37,6 +37,56 @@ export class JupiterService {
   private tokensByMint: Map<string, any> = new Map();
   private tokens: any[] = [];
 
+  private async fetchJsonWithFallback(urls: string[]): Promise<any | null> {
+    for (const url of urls) {
+      try {
+        const resp = await fetch(url, { method: 'GET' });
+        if (resp.ok) {
+          return await resp.json();
+        }
+        console.warn(`⚠️ Fallback URL failed ${url}: ${resp.status}`);
+      } catch (e) {
+        console.warn(`⚠️ Fallback request error for ${url}:`, e);
+      }
+    }
+    return null;
+  }
+
+  private async loadJupiterTokens(): Promise<void> {
+    const override = process.env.JUPITER_TOKENS_URL;
+    const urls = override
+      ? [override]
+      : [
+          'https://tokens.jup.ag/tokens?tags=verified',
+          // cache/mirrors
+          'https://cache.jup.ag/tokens',
+          'https://raw.githubusercontent.com/jup-ag/token-list/main/src/tokens/solana.tokenlist.json',
+          'https://cdn.jsdelivr.net/gh/jup-ag/token-list@main/src/tokens/solana.tokenlist.json',
+        ];
+
+    const data = await this.fetchJsonWithFallback(urls);
+    if (!data) throw new Error('Unable to load Jupiter tokens from any source');
+
+    // data could be array or tokenlist format
+    const arr = Array.isArray(data)
+      ? data
+      : Array.isArray(data?.tokens)
+      ? data.tokens
+      : [];
+
+    this.tokens = arr;
+    this.tokensBySymbol.clear();
+    this.tokensByMint.clear();
+    for (const t of this.tokens) {
+      const sym = (t.symbol || '').toUpperCase();
+      const mint = t.address || t.mint || t.id;
+      if (sym && mint) {
+        if (!this.tokensBySymbol.has(sym)) this.tokensBySymbol.set(sym, t);
+        this.tokensByMint.set(mint, t);
+      }
+    }
+  }
+
   constructor(rpcUrl?: string) {
     // Use the same RPC configuration as Drift service
     let finalRpcUrl: string;
@@ -72,26 +122,10 @@ export class JupiterService {
   async initialize(): Promise<void> {
     try {
       console.log('🚀 Initializing Jupiter Perps service...');
-      // Load Jupiter token list dynamically (verified tokens)
+      // Load Jupiter token list dynamically with fallbacks (no hardcoding)
       try {
-        const resp = await fetch('https://tokens.jup.ag/tokens?tags=verified');
-        if (resp.ok) {
-          const data: any[] = await resp.json();
-          this.tokens = Array.isArray(data) ? data : [];
-          this.tokensBySymbol.clear();
-          this.tokensByMint.clear();
-          for (const t of this.tokens) {
-            const sym = (t.symbol || '').toUpperCase();
-            const mint = t.address || t.mint || t.id;
-            if (sym && mint) {
-              if (!this.tokensBySymbol.has(sym)) this.tokensBySymbol.set(sym, t);
-              this.tokensByMint.set(mint, t);
-            }
-          }
-          console.log(`✅ Loaded ${this.tokens.length} Jupiter tokens`);
-        } else {
-          console.warn(`⚠️ Failed to load Jupiter tokens: ${resp.status}`);
-        }
+        await this.loadJupiterTokens();
+        console.log(`✅ Loaded ${this.tokens.length} Jupiter tokens`);
       } catch (e) {
         console.warn('⚠️ Error loading Jupiter tokens:', e);
       }
@@ -111,17 +145,49 @@ export class JupiterService {
     try {
       console.log('📊 Fetching real-time markets via Jupiter (dynamic token list)...');
 
-      // Pick a subset of tokens with CoinGecko id to enrich stats
-      const candidates = this.tokens.filter((t) => !!t.cgId && !!t.address);
-      const selected = candidates.slice(0, 25); // take top N to keep response light
-
-      // 1) Fetch real-time prices from Jupiter by mint addresses
-      const mintIds = selected.map((t) => t.address).join(',');
-      const priceResp = await fetch(`https://price.jup.ag/v6/price?ids=${encodeURIComponent(mintIds)}&vsToken=USDC`);
-      if (!priceResp.ok) {
-        throw new Error(`Jupiter price API error: ${priceResp.status}`);
+      // Build a dynamic selection: prioritize popular symbols then fill from token list
+      const prioritySymbols = ['SOL', 'BTC', 'ETH', 'RAY', 'JUP', 'BONK', 'WIF'];
+      const selectedMap: Map<string, any> = new Map();
+      for (const sym of prioritySymbols) {
+        const tok = this.tokensBySymbol.get(sym);
+        if (tok && tok.address) selectedMap.set(tok.address, tok);
       }
-      const priceJson: any = await priceResp.json();
+
+      // Fill up to 25 with any tokens that have address; prefer ones with cgId for 24h stats
+      const withCg = this.tokens.filter((t) => !!t.address && !!t.cgId);
+      const withoutCg = this.tokens.filter((t) => !!t.address && !t.cgId);
+      for (const arr of [withCg, withoutCg]) {
+        for (const t of arr) {
+          if (selectedMap.size >= 25) break;
+          const addr = t.address;
+          if (!selectedMap.has(addr)) selectedMap.set(addr, t);
+        }
+        if (selectedMap.size >= 25) break;
+      }
+      const selected = Array.from(selectedMap.values());
+
+      // 1) Fetch real-time prices from Jupiter by mint addresses with env override and fallbacks
+      const priceBase = process.env.JUPITER_PRICE_URL || 'https://price.jup.ag/v6/price';
+      const mintIds = selected.map((t) => t.address).join(',');
+      let priceJson: any | null = await this.fetchJsonWithFallback([
+        `${priceBase}?ids=${encodeURIComponent(mintIds)}&vsToken=USDC`,
+      ]);
+
+      // If price API unreachable, fall back to estimating price via quotes for a small USDC size per token
+      const quoteBase = process.env.JUPITER_QUOTE_URL || 'https://quote-api.jup.ag/v6/quote';
+      const usdcMint = this.tokensBySymbol.get('USDC')?.address || 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
+      const estimatePriceViaQuote = async (mint: string): Promise<number> => {
+        try {
+          const url = `${quoteBase}?inputMint=${usdcMint}&outputMint=${mint}&amount=${(100 * 1e6).toFixed(0)}&slippageBps=30`;
+          const q = await this.fetchJsonWithFallback([url]);
+          const route = Array.isArray(q?.data) ? q.data[0] : null;
+          const outAmount = Number(route?.outAmount || 0);
+          const baseUnits = outAmount / 1e9; // assume 9 decimals
+          return baseUnits > 0 ? 100 / baseUnits : 0;
+        } catch {
+          return 0;
+        }
+      };
 
       // 2) Fetch 24h change/volume from CoinGecko using cgId
       const cgIds = selected.map((t) => t.cgId).join(',');
@@ -137,17 +203,24 @@ export class JupiterService {
         }
       }
 
-      const markets: JupiterPerpMarket[] = selected.map((token, idx) => {
+      const markets: JupiterPerpMarket[] = [];
+      for (let i = 0; i < selected.length; i++) {
+        const token = selected[i];
         const symbol = (token.symbol || '').toUpperCase();
         const mint = token.address;
+        let price = 0;
         const priceEntry = priceJson?.data?.[mint];
-        const price = typeof priceEntry?.price === 'number' ? priceEntry.price : 0;
+        if (typeof priceEntry?.price === 'number') price = priceEntry.price;
+        if (!price) {
+          // fallback via quote
+          price = await estimatePriceViaQuote(mint);
+        }
         const cg = token.cgId ? cgMap[token.cgId] : undefined;
         const change24h = typeof cg?.usd_24h_change === 'number' ? cg.usd_24h_change : 0;
         const volume24h = typeof cg?.usd_24h_vol === 'number' ? cg.usd_24h_vol : 0;
-        return {
+        markets.push({
           symbol,
-          marketIndex: idx,
+          marketIndex: i,
           baseAsset: symbol,
           quoteAsset: 'USDC',
           marketType: 'spot',
@@ -155,8 +228,8 @@ export class JupiterService {
           price,
           change24h,
           volume24h,
-        };
-      });
+        });
+      }
 
       console.log(`✅ Fetched ${markets.length} Jupiter markets`);
       return markets;
@@ -236,7 +309,8 @@ export class JupiterService {
       // Last price via Jupiter Price API
       let lastPrice = 0;
       try {
-        const priceResp = await fetch(`https://price.jup.ag/v6/price?ids=${encodeURIComponent(baseMint)}&vsToken=USDC`);
+        const priceBase = process.env.JUPITER_PRICE_URL || 'https://price.jup.ag/v6/price';
+        const priceResp = await fetch(`${priceBase}?ids=${encodeURIComponent(baseMint)}&vsToken=USDC`);
         if (priceResp.ok) {
           const priceJson: any = await priceResp.json();
           const entry = priceJson?.data?.[baseMint];
