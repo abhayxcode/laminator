@@ -216,6 +216,8 @@ bot.onText(/^\/dexdrift$/, async (msg) => {
     message += "\n💡 **Usage:**\n";
     message += "• `/orderbook <symbol>` - View market details\n";
     message += "• `/dexjupiter` - Browse Jupiter Perps\n";
+  message += "• `/openjup <symbol> <size> <long|short> <slippage_bps>` - Open JUP\n";
+  message += "• `/openjup <symbol> <size> <long|short> <slippage_bps>` - Open JUP\n";
     message += "• `/dexs` - Back to all DEXs\n";
 
     await safeReply(chatId, message);
@@ -265,7 +267,7 @@ bot.onText(/^\/dexjupiter$/, async (msg) => {
     }
 
     message += "\n💡 **Usage:**\n";
-    message += "• `/jupcustody <custody_pubkey>` - Inspect custody\n";
+    // Removed advanced oracle info command from help
     message += "• `/juppositions` - Your open positions\n";
     message += "• `/dexs` - Back to all DEXs";
 
@@ -596,6 +598,67 @@ bot.onText(/^\/open (.+)$/, async (msg, match) => {
     await safeReply(chatId, "❌ Failed to process trade request. Please try again.");
   }
 });
+// /openjup <symbol> <size> <long|short> <slippage_bps>
+bot.onText(/^\/openjup (.+)$/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  try {
+    if (!(await ensureJupiterPerpsInit())) {
+      await safeReply(chatId, "❌ Jupiter Perps unavailable right now. Try again in a moment.");
+      return;
+    }
+    if (!match || !match[1]) {
+      await safeReply(chatId, "❌ **Missing parameters**\n\nUsage: `/openjup <symbol> <size> <long|short> <slippage_bps>`\nExample: `/openjup SOL 1 long 50`");
+      return;
+    }
+    const args = match[1].split(/\s+/);
+    const [symbol, sizeStr, side, slippageStr] = args;
+    if (!symbol || !sizeStr || !side || !slippageStr) {
+      await safeReply(chatId, "❌ **Missing parameters**\n\nUsage: `/openjup <symbol> <size> <long|short> <slippage_bps>`\nExample: `/openjup SOL 1 long 50`");
+      return;
+    }
+    const size = parseFloat(sizeStr);
+    const slippageBps = parseInt(slippageStr, 10);
+    if (!['long','short'].includes(side.toLowerCase())) {
+      await safeReply(chatId, "❌ **Invalid side**\n\nPlease use 'long' or 'short'.");
+      return;
+    }
+    if (isNaN(size) || size <= 0 || isNaN(slippageBps) || slippageBps < 0) {
+      await safeReply(chatId, "❌ **Invalid size or slippage**");
+      return;
+    }
+
+    const custodyRes = jupiterPerpsService.resolveCustodyBySymbol(symbol.toUpperCase());
+    if (!custodyRes) {
+      await safeReply(chatId, `❌ Market not found for ${symbol}`);
+      return;
+    }
+
+    const limitUp = await jupiterPerpsService.getLimitPriceBySymbol(symbol.toUpperCase(), slippageBps);
+    if (!limitUp || !isFinite(limitUp)) {
+      await safeReply(chatId, `❌ Could not compute limit price for ${symbol}`);
+      return;
+    }
+    const limitPrice = side.toLowerCase() === 'long' ? limitUp : (await (async () => {
+      // For shorts, slip down rather than up
+      const info = await jupiterPerpsService.getInfoBySymbol(symbol.toUpperCase());
+      if (!info) return NaN;
+      const slip = Math.max(0, slippageBps) / 10_000;
+      return info.price * (1 - slip);
+    })());
+    if (!isFinite(limitPrice)) {
+      await safeReply(chatId, `❌ Invalid computed limit price for ${symbol}`);
+      return;
+    }
+
+    await safeReply(chatId, `⏳ Building Jupiter Perps trade request...\n\n• Symbol: ${symbol.toUpperCase()}\n• Side: ${side.toUpperCase()}\n• Size: ${size}\n• Limit: $${limitPrice.toFixed(6)}\n• Custody: \`${custodyRes.custody}\``);
+
+    // TODO: Build remaining accounts and createPositionRequest + optional execute
+    await safeReply(chatId, "⚠️ Trade builder WIP: instruction construction and submit coming next.");
+  } catch (e:any) {
+    console.error('Error in /openjup:', e);
+    await safeReply(chatId, `❌ Failed to open Jupiter position: ${e?.message || e}`);
+  }
+});
 
 // /close <symbol>
 bot.onText(/^\/close (.+)$/, async (msg, match) => {
@@ -924,31 +987,31 @@ bot.onText(/^\/status$/, async (msg) => {
   }
 });
 
-// /jupcustody <custody_pubkey>
-bot.onText(/^\/jupcustody\s+(.+)$/i, async (msg, match) => {
+// /jupinfo <symbol> - show oracle info for symbol
+bot.onText(/^\/jupinfo\s+([A-Za-z0-9_-]+)$/i, async (msg, match) => {
   const chatId = msg.chat.id;
   if (!(await ensureJupiterPerpsInit())) {
     await safeReply(chatId, "❌ Jupiter Perps unavailable right now. Try again in a moment.");
     return;
   }
   try {
-    const custodyPk = (match && match[1] || '').trim();
-    if (!custodyPk) {
-      await safeReply(chatId, "Usage: /jupcustody <custody_pubkey>");
+    const symbol = (match && match[1] || '').trim();
+    await safeReply(chatId, `🔍 Fetching oracle info for ${symbol}...`);
+    const info = await jupiterPerpsService.getInfoBySymbol(symbol);
+    if (!info) {
+      await safeReply(chatId, `❌ Market not found for ${symbol}`);
       return;
     }
-    await safeReply(chatId, `🔍 Reading custody: \`${custodyPk}\``);
-    const data = await jupiterPerpsService.getCustodyData(custodyPk);
-    // Show a concise subset
-    const lines: string[] = [];
-    if (data?.oracle?.oracleAccount) lines.push(`oracleAccount: ${data.oracle.oracleAccount.toString?.() || data.oracle.oracleAccount}`);
-    if (data?.oraclePrice !== undefined) lines.push(`embedded.oraclePrice: ${Number(data.oraclePrice).toString()}`);
-    if (data?.mint) lines.push(`mint: ${data.mint.toString?.() || data.mint}`);
-    if (data?.decimals !== undefined) lines.push(`decimals: ${data.decimals}`);
-    await safeReply(chatId, `✅ Custody loaded\n${lines.join('\n')}`);
+    let message = `✅ ${info.symbol} oracle info\n\n`;
+    message += `💰 Price: $${info.price.toFixed(6)}\n`;
+    message += `📡 Source: ${info.source}\n`;
+    message += `⏱️ Age: ${info.ageSec}s\n`;
+    message += `💠 Custody: \`${info.custody}\`\n`;
+    message += `🧩 Oracle Account: \`${info.oracleAccount}\``;
+    await safeReply(chatId, message);
   } catch (e:any) {
-    console.error('Error in /jupcustody:', e);
-    await safeReply(chatId, `❌ Failed to load custody: ${e?.message || e}`);
+    console.error('Error in /jupinfo:', e);
+    await safeReply(chatId, `❌ Failed to fetch oracle info: ${e?.message || e}`);
   }
 });
 
