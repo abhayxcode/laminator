@@ -126,15 +126,15 @@ export class DriftService {
               const dummyKeypair = Keypair.generate();
               const wallet = new Wallet(dummyKeypair);
               
-              // Try to create Drift client with bulk account loader
+              // Prefer websocket subscription to avoid Helius batch limitations
               try {
                 this.driftClient = new DriftClient({
                   connection: this.connection,
                   wallet,
                   env: 'mainnet-beta',
                   accountSubscription: {
-                    type: 'polling',
-                    accountLoader: new BulkAccountLoader(this.connection, 'confirmed', 1000),
+                    type: 'websocket',
+                    resubTimeoutMs: 30000,
                   },
                 });
 
@@ -173,13 +173,24 @@ export class DriftService {
                     console.warn('⚠️ DLOBSubscriber failed to initialize:', dlobError.message);
                   }
                 }
-              } catch (bulkError: any) {
-                if (bulkError.message.includes('Batch requests are only available for paid plans')) {
-                  console.warn('⚠️ Helius free tier detected - batch requests not available');
-                  console.log('💡 Consider upgrading to Helius paid plan for full Drift Protocol access');
+              } catch (wsError: any) {
+                console.warn('⚠️ Websocket subscription failed, retrying with polling (no bulk loader)...', wsError?.message);
+                try {
+                  // As a last resort, use websocket again with a longer resub timeout
+                  this.driftClient = new DriftClient({
+                    connection: this.connection,
+                    wallet,
+                    env: 'mainnet-beta',
+                    accountSubscription: {
+                      type: 'websocket',
+                      resubTimeoutMs: 60000,
+                    },
+                  });
+                  await this.driftClient.subscribe();
+                } catch (pollError: any) {
+                  console.warn('⚠️ Polling subscription failed:', pollError?.message);
                   return null;
                 }
-                throw bulkError;
               }
             }
             
@@ -310,145 +321,8 @@ export class DriftService {
       }
     }
 
-    // Fallback: Use CoinGecko API for market data
-    try {
-      console.log('📊 Fetching market data from CoinGecko API...');
-      
-      const response = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=solana,bitcoin,ethereum,avalanche-2,polygon&vs_currencies=usd&include_24hr_change=true&include_24hr_vol=true');
-      
-      if (!response.ok) {
-        throw new Error(`CoinGecko API error: ${response.status}`);
-      }
-      
-      const data = await response.json();
-      
-      // Map CoinGecko data to our market format
-      const markets: PerpMarket[] = [
-        {
-          symbol: 'SOL',
-          marketIndex: 0,
-          baseAsset: 'SOL',
-          quoteAsset: 'USDC',
-          marketType: 'perp',
-          status: 'active',
-          price: data.solana?.usd || 0,
-          change24h: data.solana?.usd_24h_change || 0,
-          volume24h: data.solana?.usd_24h_vol || 0,
-        },
-        {
-          symbol: 'BTC',
-          marketIndex: 1,
-          baseAsset: 'BTC',
-          quoteAsset: 'USDC',
-          marketType: 'perp',
-          status: 'active',
-          price: data.bitcoin?.usd || 0,
-          change24h: data.bitcoin?.usd_24h_change || 0,
-          volume24h: data.bitcoin?.usd_24h_vol || 0,
-        },
-        {
-          symbol: 'ETH',
-          marketIndex: 2,
-          baseAsset: 'ETH',
-          quoteAsset: 'USDC',
-          marketType: 'perp',
-          status: 'active',
-          price: data.ethereum?.usd || 0,
-          change24h: data.ethereum?.usd_24h_change || 0,
-          volume24h: data.ethereum?.usd_24h_vol || 0,
-        },
-        {
-          symbol: 'AVAX',
-          marketIndex: 3,
-          baseAsset: 'AVAX',
-          quoteAsset: 'USDC',
-          marketType: 'perp',
-          status: 'active',
-          price: data['avalanche-2']?.usd || 0,
-          change24h: data['avalanche-2']?.usd_24h_change || 0,
-          volume24h: data['avalanche-2']?.usd_24h_vol || 0,
-        },
-        {
-          symbol: 'MATIC',
-          marketIndex: 4,
-          baseAsset: 'MATIC',
-          quoteAsset: 'USDC',
-          marketType: 'perp',
-          status: 'active',
-          price: data.polygon?.usd || 0.95, // Fallback price if not available
-          change24h: data.polygon?.usd_24h_change || 0,
-          volume24h: data.polygon?.usd_24h_vol || 0,
-        },
-      ];
-
-      console.log(`✅ Fetched ${markets.length} markets from CoinGecko API`);
-      return markets;
-    } catch (error) {
-      console.error('❌ Failed to get available markets from CoinGecko API:', error);
-      
-      // Final fallback: Return basic market data
-      console.log('📊 Using final fallback market data...');
-      const fallbackMarkets: PerpMarket[] = [
-        {
-          symbol: 'SOL',
-          marketIndex: 0,
-          baseAsset: 'SOL',
-          quoteAsset: 'USDC',
-          marketType: 'perp',
-          status: 'active',
-          price: 180.50,
-          change24h: 2.5,
-          volume24h: 1500000,
-        },
-        {
-          symbol: 'BTC',
-          marketIndex: 1,
-          baseAsset: 'BTC',
-          quoteAsset: 'USDC',
-          marketType: 'perp',
-          status: 'active',
-          price: 43500.00,
-          change24h: 1.2,
-          volume24h: 800000,
-        },
-        {
-          symbol: 'ETH',
-          marketIndex: 2,
-          baseAsset: 'ETH',
-          quoteAsset: 'USDC',
-          marketType: 'perp',
-          status: 'active',
-          price: 2650.00,
-          change24h: 3.1,
-          volume24h: 1200000,
-        },
-        {
-          symbol: 'AVAX',
-          marketIndex: 3,
-          baseAsset: 'AVAX',
-          quoteAsset: 'USDC',
-          marketType: 'perp',
-          status: 'active',
-          price: 35.80,
-          change24h: -1.5,
-          volume24h: 400000,
-        },
-        {
-          symbol: 'MATIC',
-          marketIndex: 4,
-          baseAsset: 'MATIC',
-          quoteAsset: 'USDC',
-          marketType: 'perp',
-          status: 'active',
-          price: 0.95,
-          change24h: 0.8,
-          volume24h: 200000,
-        },
-      ];
-      
-      console.log(`✅ Using ${fallbackMarkets.length} fallback markets`);
-      return fallbackMarkets;
-    }
+    // No external fallback; respect real-time only policy
+    throw new Error('Drift markets unavailable due to RPC limitations');
   }
 
   async getUserPositions(telegramUserId: number): Promise<UserPosition[]> {

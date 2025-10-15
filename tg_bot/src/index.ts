@@ -5,10 +5,24 @@ import { userService } from "./services/userService";
 import { privyService } from "./services/privyService";
 import { databaseService } from "./services/databaseService";
 import { dexManager } from "./services/dexManager";
+import { jupiterPerpsService } from "./services/jupiterPerpsService";
 
 // Initialize services
 let dexManagerInitialized = false;
 let databaseInitialized = false;
+let jupiterPerpsInitialized = false;
+
+async function ensureJupiterPerpsInit(): Promise<boolean> {
+  if (jupiterPerpsInitialized) return true;
+  try {
+    await jupiterPerpsService.initialize();
+    jupiterPerpsInitialized = true;
+    return true;
+  } catch (e:any) {
+    console.warn('⚠️ Jupiter Perps lazy-init failed:', e?.message || e);
+    return false;
+  }
+}
 
 // Initialize services on startup
 Promise.all([
@@ -16,8 +30,15 @@ Promise.all([
   databaseService.initialize().catch((dbError) => {
     console.warn('⚠️ Database not available, continuing without database:', dbError.message);
     return Promise.resolve(); // Continue without database
-  })
-]).then(() => {
+  }),
+]).then(async () => {
+  // Initialize Jupiter Perps Anchor service (read-only)
+  try {
+    await jupiterPerpsService.initialize();
+    jupiterPerpsInitialized = true;
+  } catch (e:any) {
+    console.warn('⚠️ Jupiter Perps Anchor init failed:', e?.message || e);
+  }
   dexManagerInitialized = true;
   databaseInitialized = true;
   console.log('✅ All services initialized (database optional)');
@@ -214,23 +235,29 @@ bot.onText(/^\/dexjupiter$/, async (msg) => {
   }
 
   try {
-    await safeReply(chatId, "📊 Fetching Jupiter markets...");
-
-    const markets = await dexManager.getMarketsForDEX('jupiter');
-
-    if (!markets || markets.length === 0) {
-      await safeReply(chatId, "❌ No Jupiter markets found");
+    if (!(await ensureJupiterPerpsInit())) {
+      await safeReply(chatId, "❌ Jupiter Perps unavailable right now. Try again in a moment.");
       return;
     }
 
-    let message = "⚡ **Jupiter - Available Markets (via Aggregator)**\n\n";
-    message += "🔥 **Real-Time Prices** (price.jup.ag)\n\n";
+    await safeReply(chatId, "📊 Fetching Jupiter Perps markets from-chain...");
+    const markets = await jupiterPerpsService.getAvailableMarkets();
 
-    markets.slice(0, 10).forEach((market, index) => {
-      message += `${index + 1}. **${market.symbol}**\n`;
-      message += `   💰 Price: $${market.price.toFixed(6)}\n`;
-      message += `   📈 24h: ${market.change24h.toFixed(2)}%\n`;
-      message += `   📊 Volume: $${market.volume24h.toLocaleString()}\n\n`;
+    if (!markets || markets.length === 0) {
+      await safeReply(chatId, "❌ No Jupiter Perps markets found");
+      return;
+    }
+
+    const top = markets
+      .sort((a: any, b: any) => a.symbol.localeCompare(b.symbol))
+      .slice(0, 10);
+
+    let message = "⚡ **Jupiter Perps - On-chain Markets**\n\n";
+    top.forEach((m: any, idx: number) => {
+      const price = typeof m.oraclePrice === 'number' && isFinite(m.oraclePrice) ? m.oraclePrice : 0;
+      message += `${idx + 1}. **${m.symbol}**\n`;
+      message += `   💠 Custody: \`${m.custody}\`\n`;
+      message += `   💰 Oracle: $${price.toFixed(6)}\n\n`;
     });
 
     if (markets.length > 10) {
@@ -238,14 +265,14 @@ bot.onText(/^\/dexjupiter$/, async (msg) => {
     }
 
     message += "\n💡 **Usage:**\n";
-    message += "• `/orderbook <symbol>` - View market details (tries Drift, then Jupiter)\n";
-    message += "• `/dexdrift` - Browse Drift Protocol\n";
+    message += "• `/jupcustody <custody_pubkey>` - Inspect custody\n";
+    message += "• `/juppositions` - Your open positions\n";
     message += "• `/dexs` - Back to all DEXs";
 
     await safeReply(chatId, message);
   } catch (error) {
-    console.error('Error fetching Jupiter markets:', error);
-    await safeReply(chatId, "❌ Failed to fetch Jupiter markets. Please try again later.");
+    console.error('Error fetching Jupiter Perps markets:', error);
+    await safeReply(chatId, "❌ Failed to fetch Jupiter Perps markets. Please try again later.");
   }
 });
 
@@ -894,6 +921,154 @@ bot.onText(/^\/status$/, async (msg) => {
   } catch (error) {
     console.error('Error in /status command:', error);
     await safeReply(chatId, "❌ Failed to get status. Please try again.");
+  }
+});
+
+// /jupcustody <custody_pubkey>
+bot.onText(/^\/jupcustody\s+(.+)$/i, async (msg, match) => {
+  const chatId = msg.chat.id;
+  if (!(await ensureJupiterPerpsInit())) {
+    await safeReply(chatId, "❌ Jupiter Perps unavailable right now. Try again in a moment.");
+    return;
+  }
+  try {
+    const custodyPk = (match && match[1] || '').trim();
+    if (!custodyPk) {
+      await safeReply(chatId, "Usage: /jupcustody <custody_pubkey>");
+      return;
+    }
+    await safeReply(chatId, `🔍 Reading custody: \`${custodyPk}\``);
+    const data = await jupiterPerpsService.getCustodyData(custodyPk);
+    // Show a concise subset
+    const lines: string[] = [];
+    if (data?.oracle?.oracleAccount) lines.push(`oracleAccount: ${data.oracle.oracleAccount.toString?.() || data.oracle.oracleAccount}`);
+    if (data?.oraclePrice !== undefined) lines.push(`embedded.oraclePrice: ${Number(data.oraclePrice).toString()}`);
+    if (data?.mint) lines.push(`mint: ${data.mint.toString?.() || data.mint}`);
+    if (data?.decimals !== undefined) lines.push(`decimals: ${data.decimals}`);
+    await safeReply(chatId, `✅ Custody loaded\n${lines.join('\n')}`);
+  } catch (e:any) {
+    console.error('Error in /jupcustody:', e);
+    await safeReply(chatId, `❌ Failed to load custody: ${e?.message || e}`);
+  }
+});
+
+// /juppositions - reads open positions for the user's wallet
+bot.onText(/^\/juppositions$/i, async (msg) => {
+  const chatId = msg.chat.id;
+  if (!databaseInitialized) {
+    await safeReply(chatId, "⏳ Database is initializing, please try again in a moment...");
+    return;
+  }
+  if (!(await ensureJupiterPerpsInit())) {
+    await safeReply(chatId, "❌ Jupiter Perps unavailable right now. Try again in a moment.");
+    return;
+  }
+  try {
+    const user = await databaseService.getUserByTelegramId(chatId);
+    if (!user || !user.wallets || user.wallets.length === 0) {
+      await safeReply(chatId, "❌ No wallet found. Use /create first.");
+      return;
+    }
+    const owner = user.wallets[0].walletAddress;
+    await safeReply(chatId, `🔍 Reading open positions for \`${owner}\``);
+    const positions = await jupiterPerpsService.getOpenPositionsForWallet(owner);
+    if (!positions || positions.length === 0) {
+      await safeReply(chatId, "✅ No open positions.");
+      return;
+    }
+    let message = "✅ Open Positions (Jupiter Perps)\n\n";
+    positions.slice(0, 10).forEach((p: any, idx: number) => {
+      const acc = p.account || {};
+      const sizeUsd = acc.sizeUsd?.toString?.() || '0';
+      const side = acc.side || acc.positionSide || '';
+      const custody = acc.custody?.toString?.() || '';
+      message += `${idx + 1}. sizeUsd=${sizeUsd} side=${side} custody=${custody}\n`;
+    });
+    if (positions.length > 10) message += `... and ${positions.length - 10} more`;
+    await safeReply(chatId, message);
+  } catch (e:any) {
+    console.error('Error in /juppositions:', e);
+    await safeReply(chatId, `❌ Failed to load positions: ${e?.message || e}`);
+  }
+});
+
+// /juppositions2 - normalized fields
+bot.onText(/^\/juppositions2$/i, async (msg) => {
+  const chatId = msg.chat.id;
+  if (!databaseInitialized) {
+    await safeReply(chatId, "⏳ Database is initializing, please try again in a moment...");
+    return;
+  }
+  if (!jupiterPerpsInitialized) {
+    await safeReply(chatId, "⏳ Jupiter Perps initializing, please wait...");
+    return;
+  }
+  try {
+    const user = await databaseService.getUserByTelegramId(chatId);
+    if (!user || !user.wallets || user.wallets.length === 0) {
+      await safeReply(chatId, "❌ No wallet found. Use /create first.");
+      return;
+    }
+    const owner = user.wallets[0].walletAddress;
+    await safeReply(chatId, `🔍 Reading open positions for \`${owner}\``);
+    const positions = await jupiterPerpsService.getUserPositions(owner);
+    if (!positions || positions.length === 0) {
+      await safeReply(chatId, "✅ No open positions.");
+      return;
+    }
+    let message = "✅ Open Positions (Jupiter Perps)\n\n";
+    positions.slice(0, 10).forEach((p: any, idx: number) => {
+      message += `${idx + 1}. sizeUsd=${p.sizeUsd.toFixed(2)} side=${p.side} custody=${p.custody}\n`;
+    });
+    if (positions.length > 10) message += `... and ${positions.length - 10} more`;
+    await safeReply(chatId, message);
+  } catch (e:any) {
+    console.error('Error in /juppositions2:', e);
+    await safeReply(chatId, `❌ Failed to load positions: ${e?.message || e}`);
+  }
+});
+
+// /jupmid <symbol> - oracle mid price by symbol
+bot.onText(/^\/jupmid\s+([A-Za-z0-9_-]+)$/i, async (msg, match) => {
+  const chatId = msg.chat.id;
+  if (!jupiterPerpsInitialized) {
+    await safeReply(chatId, "⏳ Jupiter Perps initializing, please wait...");
+    return;
+  }
+  try {
+    const symbol = (match && match[1] || '').trim();
+    await safeReply(chatId, `🔍 Fetching oracle mid-price for ${symbol}...`);
+    const res = await jupiterPerpsService.getMidPriceBySymbol(symbol);
+    if (!res) {
+      await safeReply(chatId, `❌ Market not found for ${symbol}`);
+      return;
+    }
+    await safeReply(chatId, `✅ ${res.symbol} mid-price: $${res.midPrice.toFixed(6)}\nCustody: \`${res.custody}\``);
+  } catch (e:any) {
+    console.error('Error in /jupmid:', e);
+    await safeReply(chatId, `❌ Failed to fetch mid-price: ${e?.message || e}`);
+  }
+});
+
+// /jupmidcustody <custody_pubkey> - oracle mid price by custody
+bot.onText(/^\/jupmidcustody\s+(.+)$/i, async (msg, match) => {
+  const chatId = msg.chat.id;
+  if (!jupiterPerpsInitialized) {
+    await safeReply(chatId, "⏳ Jupiter Perps initializing, please wait...");
+    return;
+  }
+  try {
+    const custodyPk = (match && match[1] || '').trim();
+    await safeReply(chatId, `🔍 Fetching oracle mid-price for custody \`${custodyPk}\`...`);
+    const res = await jupiterPerpsService.getMidPriceForCustody(custodyPk);
+    if (!res) {
+      await safeReply(chatId, `❌ Custody not found or unreadable`);
+      return;
+    }
+    await safeReply(chatId, `✅ ${res.symbol} mid-price: $${res.midPrice.toFixed(6)}\nCustody: \`${res.custody}\``);
+  } catch (e:any) {
+    console.error('Error in /jupmidcustody:', e);
+    await safeReply(chatId, `❌ Failed to fetch mid-price: ${e?.message || e}`);
   }
 });
 

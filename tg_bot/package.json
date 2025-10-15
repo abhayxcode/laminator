@@ -13,6 +13,8 @@
   "description": "",
   "dependencies": {
     "@drift-labs/sdk": "^2.142.0-beta.8",
+    "@pythnetwork/client": "^2.22.0",
+    "@coral-xyz/anchor": "^0.29.0",
     "@prisma/client": "^6.16.3",
     "@privy-io/node": "^0.2.0",
     "@privy-io/server-auth": "^1.32.5",

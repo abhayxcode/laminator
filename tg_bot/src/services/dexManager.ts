@@ -1,5 +1,6 @@
 import { DriftService } from './driftService';
 import { JupiterService } from './jupiterService';
+import { jupiterPerpsService } from './jupiterPerpsService';
 
 export interface DEXInfo {
   id: string;
@@ -60,7 +61,15 @@ export class DEXManager {
       
       await Promise.all([
         this.driftService.initialize(),
-        this.jupiterService.initialize()
+        this.jupiterService.initialize(),
+        // Initialize Anchor-based Jupiter Perps (best-effort)
+        (async () => {
+          try {
+            await jupiterPerpsService.initialize();
+          } catch (e:any) {
+            console.warn('⚠️ Jupiter Perps Anchor init failed (DEXManager):', e?.message || e);
+          }
+        })()
       ]);
       
       this.initialized = true;
@@ -127,9 +136,9 @@ export class DEXManager {
       {
         id: 'jupiter',
         name: 'Jupiter Perps',
-        description: 'Jupiter aggregator spot/route data via price.jup.ag',
+        description: 'On-chain perps via Anchor (oracle pricing)',
         isActive: true,
-        marketsCount: 25,
+        marketsCount: 5,
         volume24h: 0,
       },
     ];
@@ -155,12 +164,19 @@ export class DEXManager {
           break;
           
         case 'jupiter':
-          console.log('📊 Fetching Jupiter Perps markets...');
-          const jupiterMarkets = await this.jupiterService.getAvailableMarkets();
-          markets = jupiterMarkets.map(market => ({
-            ...market,
+          console.log('📊 Fetching Jupiter Perps markets (on-chain)...');
+          const perpsMarkets = await jupiterPerpsService.getAvailableMarkets();
+          markets = perpsMarkets.map((m, idx) => ({
+            symbol: m.symbol,
+            baseAsset: m.symbol,
+            quoteAsset: 'USDC',
+            price: m.oraclePrice || 0,
+            change24h: 0,
+            volume24h: 0,
             dexName: 'Jupiter Perps',
             dexId: 'jupiter',
+            marketType: 'perp',
+            status: 'active',
           }));
           break;
           
@@ -195,11 +211,17 @@ export class DEXManager {
           break;
           
         case 'jupiter':
-          console.log(`📈 Fetching Jupiter orderbook for ${symbol}...`);
-          orderbook = await this.jupiterService.getOrderbook(symbol);
-          if (orderbook) {
-            orderbook.dexName = 'Jupiter Perps';
-            orderbook.dexId = 'jupiter';
+          console.log(`📈 Fetching Jupiter Perps mid-price for ${symbol} (oracle)...`);
+          const mid = await jupiterPerpsService.getMidPriceBySymbol(symbol);
+          if (mid) {
+            orderbook = {
+              symbol: mid.symbol,
+              bids: [],
+              asks: [],
+              lastPrice: mid.midPrice,
+              dexName: 'Jupiter Perps',
+              dexId: 'jupiter',
+            };
           }
           break;
           
