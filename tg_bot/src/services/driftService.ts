@@ -366,7 +366,7 @@ export class DriftService {
         const currentPrice = oraclePriceData ? convertToNumber(oraclePriceData.price, PRICE_PRECISION) : 0;
 
         // Calculate position size and direction
-        const baseAssetAmount = convertToNumber(position.baseAssetAmount, 9); // SOL has 9 decimals
+        const baseAssetAmount = convertToNumber(position.baseAssetAmount, new BN(9)); // SOL has 9 decimals
         const isLong = baseAssetAmount > 0;
         const size = Math.abs(baseAssetAmount);
         
@@ -491,7 +491,7 @@ export class DriftService {
               } catch (error) {
                 console.warn(`⚠️ Failed to convert bid price with convertToNumber:`, error);
                 // Fallback: if it's a BN or similar, try dividing by precision
-                price = parseFloat(bid.price.toString()) / Math.pow(10, PRICE_PRECISION);
+                price = parseFloat(bid.price.toString()) / Math.pow(10, 6); // PRICE_PRECISION is 6
               }
             }
             
@@ -504,7 +504,7 @@ export class DriftService {
             } else {
               // Use convertToNumber with proper precision handling for size
               try {
-                size = convertToNumber(bid.size, 9);
+                size = convertToNumber(bid.size, new BN(9));
               } catch (error) {
                 console.warn(`⚠️ Failed to convert bid size with convertToNumber:`, error);
                 // Fallback: if it's a BN or similar, try dividing by precision
@@ -538,7 +538,7 @@ export class DriftService {
               } catch (error) {
                 console.warn(`⚠️ Failed to convert ask price with convertToNumber:`, error);
                 // Fallback: if it's a BN or similar, try dividing by precision
-                price = parseFloat(ask.price.toString()) / Math.pow(10, PRICE_PRECISION);
+                price = parseFloat(ask.price.toString()) / Math.pow(10, 6); // PRICE_PRECISION is 6
               }
             }
             
@@ -551,7 +551,7 @@ export class DriftService {
             } else {
               // Use convertToNumber with proper precision handling for size
               try {
-                size = convertToNumber(ask.size, 9);
+                size = convertToNumber(ask.size, new BN(9));
               } catch (error) {
                 console.warn(`⚠️ Failed to convert ask size with convertToNumber:`, error);
                 // Fallback: if it's a BN or similar, try dividing by precision
@@ -757,7 +757,7 @@ export class DriftService {
         for (const spotMarket of spotMarkets) {
           const pos = driftClient.getSpotPosition ? driftClient.getSpotPosition(spotMarket.marketIndex) : null;
           if (pos && pos.scaledBalance && !pos.scaledBalance.isZero()) {
-            const bal = convertToNumber(pos.scaledBalance, spotMarket.decimals);
+            const bal = convertToNumber(pos.scaledBalance, new BN(spotMarket.decimals));
             // Treat all as USDC-equivalent for a conservative estimate; refine per-market pricing if needed
             totalUSDC += bal;
           }

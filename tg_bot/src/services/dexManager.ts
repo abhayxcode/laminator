@@ -1,6 +1,8 @@
 import { DriftService } from './driftService';
 import { JupiterService } from './jupiterService';
 import { jupiterPerpsService } from './jupiterPerpsService';
+import { flashService } from './flashService';
+import { volumeService } from './volumeService';
 
 export interface DEXInfo {
   id: string;
@@ -58,20 +60,12 @@ export class DEXManager {
   async initialize(): Promise<void> {
     try {
       console.log('🚀 Initializing DEX Manager...');
-      
       await Promise.all([
         this.driftService.initialize(),
         this.jupiterService.initialize(),
-        // Initialize Anchor-based Jupiter Perps (best-effort)
-        (async () => {
-          try {
-            await jupiterPerpsService.initialize();
-          } catch (e:any) {
-            console.warn('⚠️ Jupiter Perps Anchor init failed (DEXManager):', e?.message || e);
-          }
-        })()
+        (async () => { try { await flashService.initialize(); } catch (e:any) { console.warn('⚠️ Flash init failed:', e?.message || e); } })(),
+        (async () => { try { await volumeService.getDexVolumes(); } catch {} })(),
       ]);
-      
       this.initialized = true;
       console.log('✅ DEX Manager initialized successfully');
     } catch (error) {
@@ -85,8 +79,6 @@ export class DEXManager {
     if (!this.initialized) {
       throw new Error('DEX Manager not initialized');
     }
-
-    // Delegate to DriftService's on-chain USDC reader (no Privy dependency)
     return await this.driftService.getUserBalance(telegramUserId);
   }
 
@@ -94,8 +86,6 @@ export class DEXManager {
     if (!this.initialized) {
       throw new Error('DEX Manager not initialized');
     }
-
-    // Delegate to DriftService's on-chain SOL reader (no Privy dependency)
     return await this.driftService.getOnchainSolBalance(telegramUserId);
   }
 
@@ -103,16 +93,13 @@ export class DEXManager {
     if (!this.initialized) {
       throw new Error('DEX Manager not initialized');
     }
-
     try {
       switch (dexId.toLowerCase()) {
         case 'drift':
           return await this.driftService.getDriftCollateralUSDC(telegramUserId);
         case 'jupiter':
-          // TODO: Implement when Jupiter Perps is integrated
           return 0;
         case 'flash':
-          // TODO: Implement when Flash is integrated
           return 0;
         default:
           throw new Error(`Unknown DEX: ${dexId}`);
@@ -123,7 +110,8 @@ export class DEXManager {
     }
   }
 
-  getAvailableDEXs(): DEXInfo[] {
+  async getAvailableDEXs(): Promise<DEXInfo[]> {
+    const vols = await volumeService.getDexVolumes().catch(() => ({ drift: { total24hUsd: 0 }, flash: { total24hUsd: 0 }, jupiter: { total24hUsd: 0 } } as any));
     return [
       {
         id: 'drift',
@@ -131,7 +119,7 @@ export class DEXManager {
         description: 'Leading Solana perpetuals exchange with 50x leverage',
         isActive: true,
         marketsCount: 79,
-        volume24h: 250000000, // $250M
+        volume24h: vols.drift?.total24hUsd || 0,
       },
       {
         id: 'jupiter',
@@ -139,7 +127,15 @@ export class DEXManager {
         description: 'On-chain perps via Anchor (oracle pricing)',
         isActive: true,
         marketsCount: 5,
-        volume24h: 0,
+        volume24h: vols.jupiter?.total24hUsd || 0,
+      },
+      {
+        id: 'flash',
+        name: 'Flash Perps',
+        description: 'Flash Trade perpetuals (oracle-based, swap-aware)',
+        isActive: true,
+        marketsCount: 10,
+        volume24h: vols.flash?.total24hUsd || 0,
       },
     ];
   }
@@ -148,10 +144,8 @@ export class DEXManager {
     if (!this.initialized) {
       throw new Error('DEX Manager not initialized');
     }
-
     try {
       let markets: any[] = [];
-      
       switch (dexId.toLowerCase()) {
         case 'drift':
           console.log('📊 Fetching Drift Protocol markets...');
@@ -162,11 +156,10 @@ export class DEXManager {
             dexId: 'drift',
           }));
           break;
-          
         case 'jupiter':
           console.log('📊 Fetching Jupiter Perps markets (on-chain)...');
           const perpsMarkets = await jupiterPerpsService.getAvailableMarkets();
-          markets = perpsMarkets.map((m, idx) => ({
+          markets = perpsMarkets.map((m: any, idx: number) => ({
             symbol: m.symbol,
             baseAsset: m.symbol,
             quoteAsset: 'USDC',
@@ -179,11 +172,25 @@ export class DEXManager {
             status: 'active',
           }));
           break;
-          
+        case 'flash':
+          console.log('📊 Fetching Flash Perps markets (SDK)...');
+          const flashMkts = await flashService.getMarkets();
+          markets = flashMkts.map(m => ({
+            symbol: m.symbol,
+            baseAsset: m.symbol,
+            quoteAsset: 'USDC',
+            price: m.price,
+            change24h: 0,
+            volume24h: 0,
+            dexName: 'Flash Perps',
+            dexId: 'flash',
+            marketType: 'perp',
+            status: 'active',
+          }));
+          break;
         default:
           throw new Error(`Unknown DEX: ${dexId}`);
       }
-
       console.log(`✅ Found ${markets.length} markets for ${dexId}`);
       return markets;
     } catch (error) {
@@ -196,10 +203,8 @@ export class DEXManager {
     if (!this.initialized) {
       throw new Error('DEX Manager not initialized');
     }
-
     try {
       let orderbook: any = null;
-      
       switch (dexId.toLowerCase()) {
         case 'drift':
           console.log(`📈 Fetching Drift orderbook for ${symbol}...`);
@@ -209,7 +214,6 @@ export class DEXManager {
             orderbook.dexId = 'drift';
           }
           break;
-          
         case 'jupiter':
           console.log(`📈 Fetching Jupiter Perps mid-price for ${symbol} (oracle)...`);
           const mid = await jupiterPerpsService.getMidPriceBySymbol(symbol);
@@ -224,11 +228,16 @@ export class DEXManager {
             };
           }
           break;
-          
+        case 'flash':
+          console.log(`📈 Fetching Flash synthetic orderbook for ${symbol}...`);
+          const sob = await flashService.getSyntheticOrderbook(symbol);
+          if (sob) {
+            orderbook = { ...sob, dexName: 'Flash Perps', dexId: 'flash' };
+          }
+          break;
         default:
           throw new Error(`Unknown DEX: ${dexId}`);
       }
-
       return orderbook;
     } catch (error) {
       console.error(`❌ Failed to get orderbook for ${dexId}:`, error);
@@ -240,23 +249,18 @@ export class DEXManager {
     if (!this.initialized) {
       throw new Error('DEX Manager not initialized');
     }
-
     try {
       let balance = 0;
-      
       switch (dexId.toLowerCase()) {
         case 'drift':
           balance = await this.driftService.getUserBalance(telegramUserId);
           break;
-          
         case 'jupiter':
           balance = await this.jupiterService.getUserBalance(telegramUserId);
           break;
-          
         default:
           throw new Error(`Unknown DEX: ${dexId}`);
       }
-
       return balance;
     } catch (error) {
       console.error(`❌ Failed to get balance for ${dexId}:`, error);
@@ -268,10 +272,8 @@ export class DEXManager {
     if (!this.initialized) {
       throw new Error('DEX Manager not initialized');
     }
-
     try {
       let positions: any[] = [];
-      
       switch (dexId.toLowerCase()) {
         case 'drift':
           const driftPositions = await this.driftService.getUserPositions(telegramUserId);
@@ -281,7 +283,6 @@ export class DEXManager {
             dexId: 'drift',
           }));
           break;
-          
         case 'jupiter':
           const jupiterPositions = await this.jupiterService.getUserPositions(telegramUserId);
           positions = jupiterPositions.map(pos => ({
@@ -290,11 +291,9 @@ export class DEXManager {
             dexId: 'jupiter',
           }));
           break;
-          
         default:
           throw new Error(`Unknown DEX: ${dexId}`);
       }
-
       return positions;
     } catch (error) {
       console.error(`❌ Failed to get positions for ${dexId}:`, error);
@@ -313,23 +312,18 @@ export class DEXManager {
     if (!this.initialized) {
       throw new Error('DEX Manager not initialized');
     }
-
     try {
       let signature = '';
-      
       switch (dexId.toLowerCase()) {
         case 'drift':
           signature = await this.driftService.openPosition(telegramUserId, symbol, size, side, leverage);
           break;
-          
         case 'jupiter':
           signature = await this.jupiterService.openPosition(telegramUserId, symbol, size, side, leverage);
           break;
-          
         default:
           throw new Error(`Unknown DEX: ${dexId}`);
       }
-
       return signature;
     } catch (error) {
       console.error(`❌ Failed to open position for ${dexId}:`, error);
@@ -341,23 +335,18 @@ export class DEXManager {
     if (!this.initialized) {
       throw new Error('DEX Manager not initialized');
     }
-
     try {
       let signature = '';
-      
       switch (dexId.toLowerCase()) {
         case 'drift':
           signature = await this.driftService.closePosition(telegramUserId, symbol);
           break;
-          
         case 'jupiter':
           signature = await this.jupiterService.closePosition(telegramUserId, symbol);
           break;
-          
         default:
           throw new Error(`Unknown DEX: ${dexId}`);
       }
-
       return signature;
     } catch (error) {
       console.error(`❌ Failed to close position for ${dexId}:`, error);

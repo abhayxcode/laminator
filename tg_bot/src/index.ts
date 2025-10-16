@@ -5,6 +5,7 @@ import { userService } from "./services/userService";
 import { privyService } from "./services/privyService";
 import { databaseService } from "./services/databaseService";
 import { dexManager } from "./services/dexManager";
+import { flashService } from "./services/flashService";
 import { jupiterPerpsService } from "./services/jupiterPerpsService";
 
 // Initialize services
@@ -139,7 +140,7 @@ bot.onText(/^\/dexs$/, async (msg) => {
   try {
     await safeReply(chatId, "📊 Fetching available DEXs...");
     
-    const dexes = dexManager.getAvailableDEXs();
+    const dexes = await dexManager.getAvailableDEXs();
     
     if (dexes.length === 0) {
       await safeReply(chatId, "❌ No DEXs found");
@@ -148,12 +149,13 @@ bot.onText(/^\/dexs$/, async (msg) => {
 
     let message = "⚡ **Laminator - Available DEXs:**\n\n";
     
-    dexes.forEach((dex, index) => {
+    dexes.forEach((dex: any, index: number) => {
       message += `${index + 1}. **${dex.name}**\n`;
       message += `   📝 ${dex.description}\n`;
       if (dex.isActive) {
         message += `   📊 Markets: ${dex.marketsCount}\n`;
-        message += `   💰 24h Volume: $${(dex.volume24h / 1000000).toFixed(1)}M\n`;
+        const volLine = `$${(dex.volume24h / 1000000).toFixed(1)}M`;
+        message += `   💰 24h Volume: ${volLine}\n`;
         message += `   🎯 Command: \`/dex${dex.id}\`\n`;
       } else {
         message += `   🚧 **Coming Soon**\n`;
@@ -164,6 +166,7 @@ bot.onText(/^\/dexs$/, async (msg) => {
     message += "💡 **Usage:**\n";
     message += "• `/dexdrift` - Browse Drift Protocol markets\n";
     message += "• `/dexjupiter` - Browse Jupiter Perps markets\n";
+    message += "• `/dexflash` - Browse Flash Perps markets\n";
     message += "• `/orderbook <symbol>` - View market details\n";
 
     await safeReply(chatId, message);
@@ -216,6 +219,7 @@ bot.onText(/^\/dexdrift$/, async (msg) => {
     message += "\n💡 **Usage:**\n";
     message += "• `/orderbook <symbol>` - View market details\n";
     message += "• `/dexjupiter` - Browse Jupiter Perps\n";
+  message += "• `/dexflash` - Browse Flash Perps\n";
   message += "• `/openjup <symbol> <size> <long|short> <slippage_bps>` - Open JUP\n";
   message += "• `/openjup <symbol> <size> <long|short> <slippage_bps>` - Open JUP\n";
     message += "• `/dexs` - Back to all DEXs\n";
@@ -228,6 +232,35 @@ bot.onText(/^\/dexdrift$/, async (msg) => {
 });
 
 // /dexjupiter - Show Jupiter Perps markets
+// /dexflash - Show Flash Perps markets
+bot.onText(/^\/dexflash$/, async (msg) => {
+  const chatId = msg.chat.id;
+  if (!dexManagerInitialized) {
+    await safeReply(chatId, "⏳ DEX services are initializing, please wait...");
+    return;
+  }
+  try {
+    await safeReply(chatId, "📊 Fetching Flash Perps markets...");
+    const markets = await dexManager.getMarketsForDEX('flash');
+    if (markets.length === 0) {
+      await safeReply(chatId, "❌ No Flash Perps markets found");
+      return;
+    }
+    let message = "⚡ **Flash Perps - Available Markets:**\n\n";
+    markets.slice(0, 10).forEach((m: any, idx: number) => {
+      message += `${idx + 1}. **${m.symbol}**\n`;
+      message += `   💰 Price: $${(m.price || 0).toFixed(6)}\n\n`;
+    });
+    if (markets.length > 10) message += `... and ${markets.length - 10} more markets`;
+    message += "\n\n💡 **Usage:**\n";
+    message += "• `/orderbook <symbol>` - View market details\n";
+    message += "• `/dexs` - Back to all DEXs";
+    await safeReply(chatId, message);
+  } catch (error) {
+    console.error('Error fetching Flash markets:', error);
+    await safeReply(chatId, "❌ Failed to fetch Flash Perps markets. Please try again later.");
+  }
+});
 bot.onText(/^\/dexjupiter$/, async (msg) => {
   const chatId = msg.chat.id;
   
@@ -387,7 +420,7 @@ bot.onText(/^\/orderbook(.*)$/, async (msg, match) => {
       }
 
       await safeReply(chatId, "📊 Fetching available DEXs...");
-      const dexes = dexManager.getAvailableDEXs();
+      const dexes = await dexManager.getAvailableDEXs();
       
       if (dexes.length === 0) {
         await safeReply(chatId, "❌ No DEXs found");
@@ -395,7 +428,7 @@ bot.onText(/^\/orderbook(.*)$/, async (msg, match) => {
       }
 
       let message = "⚡ **Available DEXs for Orderbook:**\n\n";
-    dexes.forEach((dex, index) => {
+    dexes.forEach((dex: any, index: number) => {
       message += `${index + 1}. **${dex.name}**\n`;
       if (dex.isActive) {
         message += `   📊 ${dex.marketsCount} markets available\n`;
@@ -414,6 +447,7 @@ bot.onText(/^\/orderbook(.*)$/, async (msg, match) => {
       message += "**DEX Commands:**\n";
       message += "• `/dexdrift` - Browse Drift Protocol\n";
       message += "• `/dexjupiter` - Browse Jupiter Perps\n";
+  message += "• `/dexflash` - Browse Flash Perps\n";
 
       await safeReply(chatId, message);
       return;
