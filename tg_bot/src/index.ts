@@ -7,11 +7,14 @@ import { databaseService } from "./services/databaseService";
 import { dexManager } from "./services/dexManager";
 import { flashService } from "./services/flashService";
 import { jupiterPerpsService } from "./services/jupiterPerpsService";
+import { perpetualService } from "./services/perpetualService";
+import apiServer from "./apiServer";
 
 // Initialize services
 let dexManagerInitialized = false;
 let databaseInitialized = false;
 let jupiterPerpsInitialized = false;
+let perpetualInitialized = false;
 
 async function ensureJupiterPerpsInit(): Promise<boolean> {
   if (jupiterPerpsInitialized) return true;
@@ -40,6 +43,16 @@ Promise.all([
   } catch (e:any) {
     console.warn('⚠️ Jupiter Perps Anchor init failed:', e?.message || e);
   }
+
+  // Initialize Perpetual service
+  try {
+    await perpetualService.isReady();
+    perpetualInitialized = true;
+    console.log('✅ Perpetual Service initialized');
+  } catch (e:any) {
+    console.warn('⚠️ Perpetual Service init failed:', e?.message || e);
+  }
+
   dexManagerInitialized = true;
   databaseInitialized = true;
   console.log('✅ All services initialized (database optional)');
@@ -1184,3 +1197,27 @@ bot.on("message", async (msg) => {
 });
 
 console.log("Telegram bot is running...");
+
+// Start API server if PRIVATE_KEY and RPC_URL are available
+const port = process.env.API_PORT || 3000;
+const hasApiCredentials = process.env.PRIVATE_KEY && process.env.RPC_URL;
+
+if (hasApiCredentials) {
+  apiServer.listen(port, () => {
+    console.log(`🚀 Perpetual Trading API server running on port ${port}`);
+    console.log(`📡 API endpoints available at http://localhost:${port}`);
+    console.log(`📋 Available endpoints:`);
+    console.log(`   GET  /health - Health check`);
+    console.log(`   GET  /markets - Get available markets`);
+    console.log(`   POST /users - Create user account`);
+    console.log(`   POST /deposit - Deposit collateral`);
+    console.log(`   POST /order - Place perpetual order`);
+    console.log(`   POST /close - Close position`);
+    console.log(`   GET  /positions - Get server wallet positions`);
+    console.log(`   GET  /positions/:publicKey - Get user positions`);
+    console.log(`   GET  /balance - Get server wallet balance`);
+    console.log(`   GET  /balance/:publicKey - Get user balance`);
+  });
+} else {
+  console.log(`💡 To enable API server, set PRIVATE_KEY and RPC_URL in your .env file`);
+}

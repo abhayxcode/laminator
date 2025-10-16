@@ -20,12 +20,16 @@
     "@pythnetwork/client": "^2.22.0",
     "@solana/spl-token": "^0.4.14",
     "@solana/web3.js": "^1.98.4",
+    "bn.js": "^5.2.2",
     "dotenv": "^17.2.2",
+    "express": "^5.1.0",
     "flash-sdk": "^2.12.6",
     "node-telegram-bot-api": "^0.66.0",
     "prisma": "^6.16.3"
   },
   "devDependencies": {
+    "@types/bn.js": "^5.2.0",
+    "@types/express": "^5.0.3",
     "@types/node": "^20.0.0",
     "@types/node-telegram-bot-api": "^0.64.11",
     "nodemon": "^3.0.0",
