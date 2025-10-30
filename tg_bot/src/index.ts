@@ -9,6 +9,9 @@ import { flashService } from "./services/flashService";
 import { jupiterPerpsService } from "./services/jupiterPerpsService";
 import { perpetualService } from "./services/perpetualService";
 import apiServer from "./apiServer";
+// Import new handlers for inline keyboard support
+import { handleCallbackQuery } from "./handlers/callbackQueryRouter";
+import { handleDexDriftCommand } from "./handlers/drift/index";
 
 // Initialize services
 let dexManagerInitialized = false;
@@ -189,58 +192,21 @@ bot.onText(/^\/dexs$/, async (msg) => {
   }
 });
 
-// /dexdrift - Show Drift Protocol markets
+// /dexdrift - Show Drift Protocol with inline keyboard UI
 bot.onText(/^\/dexdrift$/, async (msg) => {
   const chatId = msg.chat.id;
-  
+  const userId = msg.from?.id.toString() || String(chatId);
+
   if (!dexManagerInitialized) {
     await safeReply(chatId, "⏳ DEX services are initializing, please wait...");
     return;
   }
 
   try {
-    await safeReply(chatId, "📊 Fetching Drift Protocol markets...");
-    
-    const markets = await dexManager.getMarketsForDEX('drift');
-    
-    if (markets.length === 0) {
-      await safeReply(chatId, "❌ No Drift Protocol markets found");
-      return;
-    }
-
-    let message = "⚡ **Drift Protocol - Available Markets:**\n\n";
-    
-    // Check if we're using Helius/Drift Protocol data
-    const isUsingHelius = process.env.HELIUS_API_KEY;
-    if (isUsingHelius) {
-      message += "🔥 **Real Drift Protocol Data** (via Helius RPC)\n\n";
-    } else {
-      message += "📊 **Real-Time Market Data** (via CoinGecko API)\n\n";
-    }
-    
-    markets.slice(0, 10).forEach((market, index) => {
-      message += `${index + 1}. **${market.symbol}**\n`;
-      message += `   💰 Price: $${market.price.toFixed(4)}\n`;
-      message += `   📈 24h: ${market.change24h.toFixed(2)}%\n`;
-      message += `   📊 Volume: $${market.volume24h.toLocaleString()}\n\n`;
-    });
-
-    if (markets.length > 10) {
-      message += `... and ${markets.length - 10} more markets\n`;
-    }
-
-    message += "\n💡 **Usage:**\n";
-    message += "• `/orderbook <symbol>` - View market details\n";
-    message += "• `/dexjupiter` - Browse Jupiter Perps\n";
-  message += "• `/dexflash` - Browse Flash Perps\n";
-  message += "• `/openjup <symbol> <size> <long|short> <slippage_bps>` - Open JUP\n";
-  message += "• `/openjup <symbol> <size> <long|short> <slippage_bps>` - Open JUP\n";
-    message += "• `/dexs` - Back to all DEXs\n";
-
-    await safeReply(chatId, message);
+    await handleDexDriftCommand(bot, chatId, userId);
   } catch (error) {
-    console.error('Error fetching Drift markets:', error);
-    await safeReply(chatId, "❌ Failed to fetch Drift Protocol markets. Please try again later.");
+    console.error('Error in /dexdrift command:', error);
+    await safeReply(chatId, "❌ Failed to load Drift menu. Please try again.");
   }
 });
 
@@ -1197,6 +1163,24 @@ bot.on("message", async (msg) => {
 });
 
 console.log("Telegram bot is running...");
+
+// Handle callback queries from inline keyboards
+bot.on('callback_query', async (query) => {
+  try {
+    await handleCallbackQuery(bot, query);
+  } catch (error) {
+    console.error('Error handling callback query:', error);
+    // Try to notify user of error
+    try {
+      await bot.answerCallbackQuery(query.id, {
+        text: '❌ An error occurred. Please try again.',
+        show_alert: true,
+      });
+    } catch (e) {
+      console.error('Failed to send error notification:', e);
+    }
+  }
+});
 
 // Start API server if PRIVATE_KEY and RPC_URL are available
 const port = process.env.API_PORT || 3000;

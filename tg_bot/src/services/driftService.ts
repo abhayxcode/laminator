@@ -814,6 +814,226 @@ export class DriftService {
     }
   }
 
+  // ============================================
+  // ENHANCED SDK METHODS (Phase 2)
+  // ============================================
+
+  /**
+   * Check if user has initialized Drift account
+   */
+  async hasUserAccount(userPublicKey: SolanaPublicKey): Promise<boolean> {
+    try {
+      const driftClient = await this.getDriftClientForMarketData();
+      if (!driftClient) return false;
+
+      const userAccountPubkey = await driftClient.getUserAccountPublicKey(0); // subAccountId = 0
+      const accountInfo = await this.connection.getAccountInfo(userAccountPubkey);
+      return accountInfo !== null;
+    } catch (error) {
+      console.error('Error checking user account:', error);
+      return false;
+    }
+  }
+
+  /**
+   * Get user account data from Drift
+   */
+  async getUserAccountData(telegramUserId: number): Promise<UserAccount | null> {
+    try {
+      const driftClient = await this.getDriftClientForUser(telegramUserId);
+      return driftClient.getUserAccount() || null;
+    } catch (error) {
+      console.error('Error getting user account data:', error);
+      return null;
+    }
+  }
+
+  /**
+   * Get major perpetual markets (SOL, BTC, ETH)
+   */
+  async getMajorPerpMarkets(): Promise<PerpMarket[]> {
+    const MAJOR_INDICES = [0, 1, 2]; // SOL-PERP, BTC-PERP, ETH-PERP
+    const allMarkets = await this.getAvailableMarkets();
+    return allMarkets.filter(m => MAJOR_INDICES.includes(m.marketIndex));
+  }
+
+  /**
+   * Get spot markets (for collateral deposits)
+   */
+  async getSpotMarkets(): Promise<any[]> {
+    try {
+      const driftClient = await this.getDriftClientForMarketData();
+      if (!driftClient) throw new Error('Drift client not available');
+
+      const spotMarkets = driftClient.getSpotMarketAccounts();
+      return spotMarkets.map((market: any) => ({
+        symbol: market.name || `SPOT-${market.marketIndex}`,
+        marketIndex: market.marketIndex,
+        mint: market.mint,
+        decimals: market.decimals,
+      }));
+    } catch (error) {
+      console.error('Error getting spot markets:', error);
+      return [];
+    }
+  }
+
+  /**
+   * Get user's positions with accurate PnL calculation
+   */
+  async getUserPositionsWithPnL(telegramUserId: number): Promise<UserPosition[]> {
+    try {
+      const driftClient = await this.getDriftClientForUser(telegramUserId);
+      const userAccount = driftClient.getUserAccount();
+      if (!userAccount) return [];
+
+      const positions: UserPosition[] = [];
+
+      for (const position of userAccount.perpPositions) {
+        if (position.baseAssetAmount.eq(new BN(0))) continue;
+
+        const marketConfig = PerpMarkets['mainnet-beta'][position.marketIndex];
+        if (!marketConfig) continue;
+
+        const perpMarketAccount = driftClient.getPerpMarketAccount(position.marketIndex);
+        const oraclePriceData = driftClient.getOracleDataForPerpMarket(position.marketIndex);
+        const currentPrice = oraclePriceData ? convertToNumber(oraclePriceData.price, PRICE_PRECISION) : 0;
+
+        // Calculate position size and direction
+        const baseAssetAmount = convertToNumber(position.baseAssetAmount, new BN(9));
+        const isLong = baseAssetAmount > 0;
+        const size = Math.abs(baseAssetAmount);
+
+        // Calculate entry price
+        const quoteAssetAmount = convertToNumber(position.quoteAssetAmount, QUOTE_PRECISION);
+        const entryPrice = Math.abs(quoteAssetAmount / baseAssetAmount);
+
+        // Calculate unrealized PnL
+        const priceDiff = isLong ? (currentPrice - entryPrice) : (entryPrice - currentPrice);
+        const unrealizedPnl = priceDiff * size;
+
+        positions.push({
+          symbol: marketConfig.symbol,
+          side: isLong ? 'long' : 'short',
+          size: size,
+          entryPrice: entryPrice,
+          currentPrice: currentPrice,
+          unrealizedPnl: unrealizedPnl,
+          margin: Math.abs(quoteAssetAmount),
+        });
+      }
+
+      return positions;
+    } catch (error) {
+      console.error('Error getting user positions with PnL:', error);
+      return [];
+    }
+  }
+
+  /**
+   * Get specific position for a market
+   */
+  async getUserPosition(telegramUserId: number, marketIndex: number): Promise<UserPosition | null> {
+    const positions = await this.getUserPositionsWithPnL(telegramUserId);
+    return positions.find(p => p.symbol.includes(String(marketIndex))) || null;
+  }
+
+  /**
+   * Get user's collateral info in Drift
+   */
+  async getUserCollateral(telegramUserId: number): Promise<{ total: number; free: number; used: number; availableWithdraw: number }> {
+    try {
+      const driftClient = await this.getDriftClientForUser(telegramUserId);
+      const userAccount = driftClient.getUserAccount();
+
+      if (!userAccount) {
+        return { total: 0, free: 0, used: 0, availableWithdraw: 0 };
+      }
+
+      // Get total collateral (simplified - just spot position values)
+      let totalCollateral = 0;
+      try {
+        const spotMarkets = driftClient.getSpotMarketAccounts();
+        for (const spotMarket of spotMarkets) {
+          const pos = userAccount.spotPositions.find((p: any) => p.marketIndex === spotMarket.marketIndex);
+          if (pos && pos.scaledBalance && !pos.scaledBalance.isZero()) {
+            const bal = convertToNumber(pos.scaledBalance, new BN(spotMarket.decimals));
+            totalCollateral += bal;
+          }
+        }
+      } catch (e) {
+        console.warn('Failed to calculate collateral:', e);
+      }
+
+      // Estimate free collateral (simplified)
+      const freeCollateral = totalCollateral * 0.8; // Conservative estimate
+      const usedCollateral = totalCollateral - freeCollateral;
+
+      return {
+        total: totalCollateral,
+        free: freeCollateral,
+        used: usedCollateral,
+        availableWithdraw: freeCollateral,
+      };
+    } catch (error) {
+      console.error('Error getting user collateral:', error);
+      return { total: 0, free: 0, used: 0, availableWithdraw: 0 };
+    }
+  }
+
+  /**
+   * Get user's spot positions (collateral breakdown by token)
+   */
+  async getSpotPositions(telegramUserId: number): Promise<any[]> {
+    try {
+      const driftClient = await this.getDriftClientForUser(telegramUserId);
+      const userAccount = driftClient.getUserAccount();
+      if (!userAccount) return [];
+
+      const positions: any[] = [];
+      const spotMarkets = driftClient.getSpotMarketAccounts();
+
+      for (const spotMarket of spotMarkets) {
+        const position = userAccount.spotPositions.find((p: any) => p.marketIndex === spotMarket.marketIndex);
+        if (!position || position.scaledBalance.isZero()) continue;
+
+        const balance = convertToNumber(position.scaledBalance, new BN(spotMarket.decimals));
+
+        positions.push({
+          symbol: spotMarket.name || `SPOT-${spotMarket.marketIndex}`,
+          marketIndex: spotMarket.marketIndex,
+          balance: balance,
+          value: balance, // Multiply by token price if needed
+        });
+      }
+
+      return positions;
+    } catch (error) {
+      console.error('Error getting spot positions:', error);
+      return [];
+    }
+  }
+
+  /**
+   * Get orderbook with custom depth
+   */
+  async getOrderbookWithDepth(symbol: string, depth: number = 10): Promise<OrderbookData | null> {
+    try {
+      const orderbook = await this.getOrderbook(symbol);
+      if (!orderbook) return null;
+
+      return {
+        symbol: orderbook.symbol,
+        bids: orderbook.bids.slice(0, depth),
+        asks: orderbook.asks.slice(0, depth),
+        lastPrice: orderbook.lastPrice,
+      };
+    } catch (error) {
+      console.error('Error getting orderbook with depth:', error);
+      return null;
+    }
+  }
+
   disconnect(): void {
     try {
       if (this.dlobSubscriber) {
@@ -832,3 +1052,6 @@ export class DriftService {
     }
   }
 }
+
+// Export singleton instance for use in handlers
+export const driftService = new DriftService();
