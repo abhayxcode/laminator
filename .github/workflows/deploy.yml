@@ -21,8 +21,8 @@ jobs:
       - name: Build and push Docker image
         uses: docker/build-push-action@v2
         with:
-          context: .
-          file: ./tg_bot/Dockerfile
+          context: tg_bot
+          file: Dockerfile
           push: true
           tags: abhayxcode/laminator:latest
 
