@@ -13,7 +13,7 @@ export interface CreateWalletData {
   privyWalletId?: string;
   walletAddress: string;
   walletType?: 'PRIVY' | 'PHANTOM' | 'SOLFLARE' | 'BACKPACK' | 'EXTERNAL';
-  chainType?: 'SOLANA' | 'ETHEREUM' | 'POLYGON';
+  chainType?: 'SOLANA'; // Solana-only - no Ethereum/EVM support
 }
 
 export interface UpdateBalanceData {
@@ -65,7 +65,7 @@ export class DatabaseService {
 
   constructor() {
     this.prisma = new PrismaClient({
-      log: ['query', 'info', 'warn', 'error'],
+      log: ['info', 'warn', 'error'],
     });
   }
 
@@ -83,6 +83,13 @@ export class DatabaseService {
   async disconnect(): Promise<void> {
     await this.prisma.$disconnect();
     this.initialized = false;
+  }
+
+  /**
+   * Get Prisma client instance for direct access
+   */
+  getPrisma(): PrismaClient {
+    return this.prisma;
   }
 
   // ==============================================

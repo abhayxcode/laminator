@@ -318,7 +318,17 @@ export class PerpetualService {
     }
 
     try {
-      const user = this.driftClient.getUser();
+      // Check if user exists before trying to get it
+      let user;
+      try {
+        user = this.driftClient.getUser();
+      } catch (error: any) {
+        if (error?.message?.includes('has no user')) {
+          throw new Error("User account not found in Drift");
+        }
+        throw error;
+      }
+      
       const position = user.getPerpPosition(marketIndex);
 
       if (!position || position.baseAssetAmount.isZero()) {
@@ -341,7 +351,17 @@ export class PerpetualService {
     }
 
     try {
-      const user = this.driftClient.getUser();
+      // Check if user exists before trying to get it
+      let user;
+      try {
+        user = this.driftClient.getUser();
+      } catch (error: any) {
+        if (error?.message?.includes('has no user')) {
+          // User not found - return empty array
+          return [];
+        }
+        throw error;
+      }
       const positions: PerpetualPosition[] = [];
 
       // Get all perp positions - iterate through all possible market indices
@@ -401,7 +421,17 @@ export class PerpetualService {
     }
 
     try {
-      const user = this.driftClient.getUser();
+      // Check if user exists before trying to get it
+      let user;
+      try {
+        user = this.driftClient.getUser();
+      } catch (error: any) {
+        if (error?.message?.includes('has no user')) {
+          // User not found - return 0 balance
+          return 0;
+        }
+        throw error;
+      }
       
       // Get total collateral (converted to USDC equivalent)
       let totalUSDC = 0;

@@ -8,10 +8,13 @@ import { dexManager } from "./services/dexManager";
 import { flashService } from "./services/flashService";
 import { jupiterPerpsService } from "./services/jupiterPerpsService";
 import { perpetualService } from "./services/perpetualService";
+import { driftService } from "./services/driftService";
 import apiServer from "./apiServer";
 // Import new handlers for inline keyboard support
 import { handleCallbackQuery } from "./handlers/callbackQueryRouter";
 import { handleDexDriftCommand } from "./handlers/drift/index";
+import { syncDriftMarkets } from "./scripts/syncDriftMarkets";
+import { walletBalanceMonitorService } from "./services/walletBalanceMonitorService";
 
 // Initialize services
 let dexManagerInitialized = false;
@@ -31,44 +34,85 @@ async function ensureJupiterPerpsInit(): Promise<boolean> {
   }
 }
 
-// Initialize services on startup
-Promise.all([
-  dexManager.initialize(),
-  databaseService.initialize().catch((dbError) => {
-    console.warn('⚠️ Database not available, continuing without database:', dbError.message);
-    return Promise.resolve(); // Continue without database
-  }),
-]).then(async () => {
-  // Initialize Jupiter Perps Anchor service (read-only)
+// Initialize services on startup with proper async/await pattern
+(async () => {
   try {
-    await jupiterPerpsService.initialize();
-    jupiterPerpsInitialized = true;
-  } catch (e:any) {
-    console.warn('⚠️ Jupiter Perps Anchor init failed:', e?.message || e);
-  }
+    console.log('🚀 Starting service initialization...');
 
-  // Initialize Perpetual service
-  try {
-    await perpetualService.isReady();
-    perpetualInitialized = true;
-    console.log('✅ Perpetual Service initialized');
-  } catch (e:any) {
-    console.warn('⚠️ Perpetual Service init failed:', e?.message || e);
-  }
+    // Initialize core services first
+    await dexManager.initialize();
+    console.log('✅ DEX Manager initialized');
+    
+    // Initialize singleton driftService instance (used by handlers)
+    // Note: dexManager has its own instance, but handlers use the singleton
+    await driftService.initialize();
+    console.log('✅ Drift Service singleton initialized');
 
-  dexManagerInitialized = true;
-  databaseInitialized = true;
-  console.log('✅ All services initialized (database optional)');
-}).catch((error) => {
-  console.error('❌ Failed to initialize services:', error);
-  // Still try to initialize DEX manager
-  dexManager.initialize().then(() => {
+    // Initialize database (optional, continues on failure)
+    try {
+      await databaseService.initialize();
+      databaseInitialized = true;
+      console.log('✅ Database initialized');
+    } catch (dbError: any) {
+      console.warn('⚠️ Database not available, continuing without database:', dbError.message);
+    }
+
+    // Initialize Jupiter Perps Anchor service (read-only)
+    try {
+      await jupiterPerpsService.initialize();
+      jupiterPerpsInitialized = true;
+      console.log('✅ Jupiter Perps initialized');
+    } catch (e:any) {
+      console.warn('⚠️ Jupiter Perps Anchor init failed:', e?.message || e);
+    }
+
+    // Initialize Perpetual service
+    try {
+      await perpetualService.isReady();
+      perpetualInitialized = true;
+      console.log('✅ Perpetual Service initialized');
+    } catch (e:any) {
+      console.warn('⚠️ Perpetual Service init failed:', e?.message || e);
+    }
+
+    // Sync Drift markets on startup
+    try {
+      await syncDriftMarkets();
+      console.log('✅ Drift markets synced to database');
+    } catch (e:any) {
+      console.warn('⚠️ Failed to sync Drift markets (continuing anyway):', e?.message || e);
+    }
+
+    // Preload Drift markets to initialize drift client and DLOB subscriber
+    // This is CRITICAL - ensures markets are cached and client is ready
+    try {
+      console.log('🔄 Preloading Drift markets and initializing client...');
+      const markets = await dexManager.getMarketsForDEX('drift');
+      console.log(`✅ Drift markets preloaded - ${markets.length} markets cached, client ready`);
+    } catch (e:any) {
+      console.error('❌ CRITICAL: Failed to preload Drift markets:', e?.message || e);
+      console.error('   This means /dexdrift will not work until markets are loaded');
+    }
+
+    // Initialize wallet balance monitor (if database is available)
+    if (databaseInitialized) {
+      try {
+        await walletBalanceMonitorService.initialize();
+        console.log('✅ Wallet balance monitor initialized');
+      } catch (e:any) {
+        console.warn('⚠️ Failed to initialize wallet balance monitor (continuing anyway):', e?.message || e);
+      }
+    }
+
+    // Mark DEX manager as fully initialized
     dexManagerInitialized = true;
-    console.log('✅ DEX Manager initialized (database unavailable)');
-  }).catch((dexError) => {
-    console.error('❌ Failed to initialize DEX Manager:', dexError);
-  });
-});
+    console.log('✅ All services initialized successfully');
+    console.log('📊 Bot is ready to accept commands');
+  } catch (error) {
+    console.error('❌ Critical initialization error:', error);
+    console.error('   Bot may have limited functionality');
+  }
+})();
 
 // /start
 bot.onText(/^\/start$/, async (msg) => {
@@ -198,15 +242,31 @@ bot.onText(/^\/dexdrift$/, async (msg) => {
   const userId = msg.from?.id.toString() || String(chatId);
 
   if (!dexManagerInitialized) {
-    await safeReply(chatId, "⏳ DEX services are initializing, please wait...");
+    await safeReply(chatId, "⏳ **Services are still initializing...**\n\nPlease wait a moment and try again.\n\n💡 Initialization usually takes 10-30 seconds on startup.");
     return;
   }
 
   try {
+    // Send initial loading message
+    await safeReply(chatId, "📊 **Loading Drift Protocol markets...**\n\nPlease wait...");
+
+    // Load the Drift menu
     await handleDexDriftCommand(bot, chatId, userId);
-  } catch (error) {
+  } catch (error: any) {
     console.error('Error in /dexdrift command:', error);
-    await safeReply(chatId, "❌ Failed to load Drift menu. Please try again.");
+
+    // Provide helpful error message based on error type
+    let errorMessage = "❌ **Failed to load Drift menu**\n\n";
+
+    if (error?.message?.includes('not initialized')) {
+      errorMessage += "The Drift service is not ready yet. Please wait a moment and try again.";
+    } else if (error?.message?.includes('RPC')) {
+      errorMessage += "There was an issue connecting to the Solana network. Please try again in a moment.";
+    } else {
+      errorMessage += "An unexpected error occurred. Please try again or use `/status` to check service health.";
+    }
+
+    await safeReply(chatId, errorMessage);
   }
 });
 
@@ -335,7 +395,7 @@ bot.onText(/^\/balance$/, async (msg) => {
       const walletSolResolved = await dexManager.getWalletSolBalance(chatId);
 
       message += `💰 **Wallet USDC:** ${walletUsdc.toFixed(2)} USDC\n`;
-      message += `💰 **Wallet SOL:** ${walletSolResolved.toFixed(4)} SOL\n`;
+      message += `💰 **Wallet SOL:** ${walletSolResolved.toFixed(9)} SOL\n`;
       message += `🏦 **Drift Collateral:** ${driftCollateral.toFixed(2)} USDC\n\n`;
       
       if (walletUsdc > 0 || walletSolResolved > 0 || driftCollateral > 0) {
@@ -360,13 +420,14 @@ bot.onText(/^\/balance$/, async (msg) => {
         balances.forEach(balance => {
           if (balance.balance > 0 || balance.lockedBalance > 0) {
             hasAnyBalance = true;
-            message += `💰 **${balance.tokenSymbol}:** ${balance.balance.toFixed(4)} (Available: ${balance.availableBalance.toFixed(4)})\n`;
+            const decimals = balance.tokenSymbol === 'SOL' ? 9 : 4;
+            message += `💰 **${balance.tokenSymbol}:** ${balance.balance.toFixed(decimals)} (Available: ${balance.availableBalance.toFixed(decimals)})\n`;
           }
         });
       }
       
       if (!hasAnyBalance) {
-        message += "💰 **SOL Balance:** 0.0000 SOL\n";
+        message += "💰 **SOL Balance:** 0.000000000 SOL\n";
         message += "💵 **USDC Balance:** $0.0000 USDC\n\n";
         message += "💡 **Deposit SOL to start trading:**\n";
         message += "• Send SOL to your wallet address\n";
@@ -841,7 +902,8 @@ bot.onText(/^\/wallet$/, async (msg) => {
         message += "💰 **Balances:**\n";
         balances.forEach(balance => {
           if (balance.balance > 0 || balance.lockedBalance > 0) {
-            message += `• ${balance.tokenSymbol}: ${balance.balance.toFixed(4)} (Available: ${balance.availableBalance.toFixed(4)})\n`;
+            const decimals = balance.tokenSymbol === 'SOL' ? 9 : 4;
+            message += `• ${balance.tokenSymbol}: ${balance.balance.toFixed(decimals)} (Available: ${balance.availableBalance.toFixed(decimals)})\n`;
           }
         });
         message += "\n";
@@ -971,7 +1033,7 @@ bot.onText(/^\/status$/, async (msg) => {
     if (status.hasWallet) {
       message += `• ✅ Wallet Connected\n`;
       message += `• Address: \`${status.walletAddress}\`\n`;
-      message += `• Balance: ${status.balance?.toFixed(4)} SOL\n`;
+      message += `• Balance: ${status.balance?.toFixed(9)} SOL\n`;
     } else {
       message += `• ❌ No Wallet Connected\n`;
       message += `• Use \`/create\` to create one\n`;

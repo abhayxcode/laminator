@@ -12,6 +12,7 @@ import { driftService } from '../../services/driftService';
 import { createDriftTransactionService } from '../../services/driftTransactionService';
 import { privySigningService } from '../../services/privySigningService';
 import { databaseService } from '../../services/databaseService';
+import { driftDatabaseService } from '../../services/driftDatabaseService';
 import { PublicKey } from '@solana/web3.js';
 import { formatUSD } from '../../types/drift.types';
 
@@ -39,7 +40,7 @@ export async function handleClosePosition(
       break;
 
     case SubAction.CONFIRM:
-      await executeClosePosition(bot, chatId, userId, params[1]);
+      await executeClosePosition(bot, chatId, userId, params[1], params[2]);
       break;
 
     case SubAction.CANCEL:
@@ -220,15 +221,24 @@ async function executeClosePosition(
   bot: TelegramBot,
   chatId: number,
   userId: string,
-  confirmData: string
+  marketIndexStr: string | undefined,
+  percentageStr: string | undefined
 ): Promise<void> {
+  let txRecord: any = null;
+
   try {
     await bot.sendMessage(chatId, '⏳ Building transaction...');
 
-    // Parse confirm data
-    const [marketIndexStr, percentageStr] = confirmData.split(':');
+    // Parse parameters
+    if (!marketIndexStr || !percentageStr) {
+      throw new Error('Missing market index or percentage');
+    }
     const marketIndex = parseInt(marketIndexStr);
     const percentage = parseInt(percentageStr);
+    
+    if (isNaN(marketIndex) || isNaN(percentage)) {
+      throw new Error(`Invalid parameters: marketIndex=${marketIndexStr}, percentage=${percentageStr}`);
+    }
 
     // Get position info before closing
     const position = await driftService.getUserPosition(chatId, marketIndex);
@@ -242,12 +252,34 @@ async function executeClosePosition(
       throw new Error('User wallet not found');
     }
 
-    const wallet = dbUser.wallets.find((w: any) => w.blockchain === 'SOLANA');
+    const wallet = dbUser.wallets.find((w: any) => w.chainType === 'SOLANA');
     if (!wallet) {
       throw new Error('Solana wallet not found');
     }
 
     const userPublicKey = new PublicKey(wallet.walletAddress);
+
+    // Get position record from database
+    const positionRecord = await driftDatabaseService.getPositionByMarket(
+      dbUser.id,
+      marketIndex
+    );
+
+    if (!positionRecord) {
+      throw new Error('Position not found in database');
+    }
+
+    // Create transaction record
+    txRecord = await driftDatabaseService.createTransaction({
+      userId: dbUser.id,
+      walletId: wallet.id,
+      txType: 'CLOSE_POSITION',
+      positionId: positionRecord.id,
+      marketIndex,
+      metadata: {
+        closePercentage: percentage
+      }
+    });
 
     // Get Drift client
     const driftClient = await (driftService as any).getDriftClientForMarketData();
@@ -255,49 +287,104 @@ async function executeClosePosition(
       throw new Error('Drift client not available');
     }
 
-    const txService = createDriftTransactionService(driftClient);
+    const connection = (driftService as any).connection;
+    const txService = createDriftTransactionService(driftClient, connection);
+
+    // Load user account data for position info
+    const userAccount = await (driftService as any).loadUserAccount(driftClient, userPublicKey);
+    if (!userAccount) {
+      throw new Error('User account data not available');
+    }
 
     await bot.sendMessage(chatId, '🔧 Building close order...');
 
-    // Build close position transaction
+    // Build close position transaction (pass user account data)
     const tx = await txService.buildClosePositionTransaction(
       userPublicKey,
       marketIndex,
-      percentage
+      percentage,
+      userAccount // Pass user account data
     );
 
     await bot.sendMessage(chatId, '🔐 Signing with Privy...');
 
-    // Sign and send with Privy
-    const signature = await privySigningService.signAndSendTransaction(
+    // Sign and send with Privy and retry
+    const signature = await privySigningService.signAndSendTransactionWithRetry(
       chatId,
       tx,
-      (driftService as any).connection
+      (driftService as any).connection,
+      {
+        onRetry: async (attempt) => {
+          await driftDatabaseService.updateTransaction(txRecord.id, {
+            retryCount: attempt
+          });
+        }
+      }
     );
+
+    // Calculate closed amounts
+    const closeSize = (position.size * percentage) / 100;
+    const realizedPnl = (position.unrealizedPnl * percentage) / 100;
+
+    // Update transaction record
+    await driftDatabaseService.updateTransaction(txRecord.id, {
+      status: 'CONFIRMED',
+      txHash: signature,
+      confirmedAt: new Date()
+    });
+
+    // Update position record
+    if (percentage === 100) {
+      // Full close
+      await driftDatabaseService.updatePosition(positionRecord.id, {
+        status: 'CLOSED',
+        realizedPnl: realizedPnl.toString(),
+        closedAt: new Date()
+      });
+    } else {
+      // Partial close - update amounts
+      const remainingAmount = parseFloat(positionRecord.baseAssetAmount.toString()) * (1 - percentage / 100);
+      const currentRealizedPnl = parseFloat(positionRecord.realizedPnl.toString());
+      await driftDatabaseService.updatePosition(positionRecord.id, {
+        baseAssetAmount: remainingAmount.toString(),
+        realizedPnl: (currentRealizedPnl + realizedPnl).toString()
+      });
+    }
 
     // Clear session
     sessionManager.clearFlow(userId);
 
-    // Calculate closed amounts for display
-    const closeSize = (position.size * percentage) / 100;
-    const closePnl = (position.unrealizedPnl * percentage) / 100;
-    const dirEmoji = position.side === 'long' ? '🔼' : '🔽';
-    const pnlEmoji = closePnl >= 0 ? '🟢' : '🔴';
-
     // Send success message
+    const dirEmoji = position.side === 'long' ? '🔼' : '🔽';
+    const pnlEmoji = realizedPnl >= 0 ? '🟢' : '🔴';
     const explorerUrl = `https://solscan.io/tx/${signature}`;
+    
     await bot.sendMessage(
       chatId,
       `✅ **Position Closed!**\n\n` +
       `${dirEmoji} **${position.side.toUpperCase()} ${position.symbol}**\n` +
       `Closed: **${percentage}%** (${closeSize.toFixed(4)} ${position.symbol})\n` +
-      `${pnlEmoji} Realized PnL: **${formatUSD(closePnl)}**\n\n` +
+      `${pnlEmoji} Realized PnL: **${formatUSD(realizedPnl)}**\n\n` +
       `[View on Explorer](${explorerUrl})`,
-      { parse_mode: 'Markdown' }
+      {
+        parse_mode: 'Markdown',
+        reply_markup: {
+          inline_keyboard: buildDriftMainKeyboard(),
+        },
+      }
     );
 
   } catch (error) {
     console.error('Close position error:', error);
+    
+    if (txRecord) {
+      await driftDatabaseService.updateTransaction(txRecord.id, {
+        status: 'FAILED',
+        errorMessage: (error as Error).message,
+        errorType: classifyError(error)
+      });
+    }
+    
     sessionManager.clearFlow(userId);
     await bot.sendMessage(
       chatId,
@@ -306,4 +393,17 @@ async function executeClosePosition(
       `Please try again or contact support.`
     );
   }
+}
+
+// Error classification helper
+function classifyError(error: any): string {
+  const msg = error?.message?.toLowerCase() || '';
+  
+  if (msg.includes('insufficient')) return 'INSUFFICIENT_BALANCE';
+  if (msg.includes('timeout')) return 'TIMEOUT';
+  if (msg.includes('network')) return 'NETWORK_ERROR';
+  if (msg.includes('rpc')) return 'RPC_ERROR';
+  if (msg.includes('privy')) return 'PRIVY_ERROR';
+  
+  return 'UNKNOWN';
 }

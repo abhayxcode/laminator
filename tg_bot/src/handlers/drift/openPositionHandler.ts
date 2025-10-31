@@ -12,6 +12,7 @@ import { driftService } from '../../services/driftService';
 import { createDriftTransactionService } from '../../services/driftTransactionService';
 import { privySigningService } from '../../services/privySigningService';
 import { databaseService } from '../../services/databaseService';
+import { driftDatabaseService } from '../../services/driftDatabaseService';
 import { PublicKey } from '@solana/web3.js';
 import { PerpMarkets, BASE_PRECISION, BN } from '@drift-labs/sdk';
 
@@ -43,7 +44,7 @@ export async function handleOpenPosition(
       break;
 
     case SubAction.CONFIRM:
-      await executeOpenPosition(bot, chatId, userId, params[1]);
+      await executeOpenPosition(bot, chatId, userId, params.slice(1).join(':'));
       break;
 
     case SubAction.CANCEL:
@@ -265,13 +266,16 @@ async function executeOpenPosition(
   userId: string,
   confirmData: string
 ): Promise<void> {
+  let orderRecord: any = null;
+  let txRecord: any = null;
+
   try {
     await bot.sendMessage(chatId, '⏳ Building transaction...');
 
     // Parse confirm data
     const [marketIndexStr, direction, amountStr, orderType] = confirmData.split(':');
     const marketIndex = parseInt(marketIndexStr);
-    const amount = parseFloat(amountStr);
+    const size = parseFloat(amountStr);
 
     // Get user from database
     const dbUser = await databaseService.getUserByTelegramId(chatId);
@@ -279,7 +283,7 @@ async function executeOpenPosition(
       throw new Error('User wallet not found');
     }
 
-    const wallet = dbUser.wallets.find((w: any) => w.blockchain === 'SOLANA');
+    const wallet = dbUser.wallets.find((w: any) => w.chainType === 'SOLANA');
     if (!wallet) {
       throw new Error('Solana wallet not found');
     }
@@ -293,8 +297,50 @@ async function executeOpenPosition(
       throw new Error('Market not found');
     }
 
-    // Convert amount to BN with proper precision (BASE_PRECISION for perp base amounts)
-    const amountBN = new BN(amount * BASE_PRECISION.toNumber());
+    // Get current price
+    const markets = await driftService.getAvailableMarkets();
+    const marketInfo = markets.find((m: any) => m.marketIndex === marketIndex);
+    const currentPrice = marketInfo?.price || 0;
+
+    // Convert amount to BN with proper precision
+    const sizeBN = new BN(size * BASE_PRECISION.toNumber());
+
+    // Create market record if needed (from database)
+    let dbMarket = await driftDatabaseService.getMarketByIndex(marketIndex);
+    if (!dbMarket) {
+      throw new Error('Market not found in database. Please sync markets first.');
+    }
+
+    // Create order record BEFORE execution
+    orderRecord = await driftDatabaseService.createOrder({
+      userId: dbUser.id,
+      walletId: wallet.id,
+      marketId: dbMarket.id,
+      marketIndex,
+      orderType: 'MARKET',
+      side: direction.toUpperCase(),
+      direction: direction === 'long' ? 'LONG' : 'SHORT',
+      baseAssetAmount: sizeBN.toString(),
+      leverage: '1.0',
+      metadata: {
+        requestedSize: size,
+        symbol: market.baseAssetSymbol
+      }
+    });
+
+    // Create transaction record
+    txRecord = await driftDatabaseService.createTransaction({
+      userId: dbUser.id,
+      walletId: wallet.id,
+      txType: 'OPEN_POSITION',
+      orderId: orderRecord.id,
+      marketIndex,
+      amount: size.toString(),
+      metadata: {
+        direction,
+        orderType: 'MARKET'
+      }
+    });
 
     // Get Drift client
     const driftClient = await (driftService as any).getDriftClientForMarketData();
@@ -302,7 +348,8 @@ async function executeOpenPosition(
       throw new Error('Drift client not available');
     }
 
-    const txService = createDriftTransactionService(driftClient);
+    const connection = (driftService as any).connection;
+    const txService = createDriftTransactionService(driftClient, connection);
 
     await bot.sendMessage(chatId, '🔧 Building order...');
 
@@ -311,18 +358,59 @@ async function executeOpenPosition(
       userPublicKey,
       marketIndex,
       direction as 'long' | 'short',
-      amountBN,
+      sizeBN,
       orderType as 'market' | 'limit'
     );
 
     await bot.sendMessage(chatId, '🔐 Signing with Privy...');
 
-    // Sign and send with Privy
-    const signature = await privySigningService.signAndSendTransaction(
+    // Sign and send with Privy and retry
+    const signature = await privySigningService.signAndSendTransactionWithRetry(
       chatId,
       tx,
-      (driftService as any).connection
+      (driftService as any).connection,
+      {
+        onRetry: async (attempt) => {
+          await driftDatabaseService.updateTransaction(txRecord.id, {
+            retryCount: attempt
+          });
+        }
+      }
     );
+
+    // Update records on success
+    await driftDatabaseService.updateTransaction(txRecord.id, {
+      status: 'CONFIRMED',
+      txHash: signature,
+      confirmedAt: new Date()
+    });
+
+    await driftDatabaseService.updateOrderStatus(orderRecord.id, {
+      status: 'FILLED',
+      filledAmount: sizeBN.toString(),
+      filledAt: new Date()
+    });
+
+    // Create or update position record
+    const positionRecord = await driftDatabaseService.createPosition({
+      userId: dbUser.id,
+      walletId: wallet.id,
+      marketId: dbMarket.id,
+      marketIndex,
+      side: direction.toUpperCase(),
+      baseAssetAmount: sizeBN.toString(),
+      quoteAssetAmount: (size * currentPrice).toString(),
+      entryPrice: currentPrice.toString(),
+      marginAmount: (size * currentPrice).toString(), // Simplified
+      metadata: {
+        orderId: orderRecord.id,
+        txHash: signature
+      }
+    });
+
+    // Fetch the updated position to show net size
+    const isClosed = positionRecord.status === 'CLOSED';
+    const netPosition = isClosed ? null : await driftDatabaseService.getPositionByMarket(dbUser.id, marketIndex);
 
     // Clear session
     sessionManager.clearFlow(userId);
@@ -330,17 +418,50 @@ async function executeOpenPosition(
     // Send success message
     const dirEmoji = direction === OrderDirection.LONG ? '🔼' : '🔽';
     const explorerUrl = `https://solscan.io/tx/${signature}`;
+    
+    let message = '';
+    if (isClosed) {
+      message = `✅ **Position Closed!**\n\n` +
+        `Your positions have been fully netted out.\n\n` +
+        `[View on Explorer](${explorerUrl})`;
+    } else {
+      const netSize = netPosition ? parseFloat(netPosition.baseAssetAmount.toString()) : size;
+      message = `✅ **Position Updated!**\n\n` +
+        `${dirEmoji} **${direction.toUpperCase()} ${market.baseAssetSymbol}**\n` +
+        `Trade Size: **${size} ${market.baseAssetSymbol}**\n` +
+        `Net Position: **${netSize.toFixed(6)} ${market.baseAssetSymbol}**\n\n` +
+        `[View on Explorer](${explorerUrl})`;
+    }
+    
     await bot.sendMessage(
       chatId,
-      `✅ **Position Opened!**\n\n` +
-      `${dirEmoji} **${direction.toUpperCase()} ${market.baseAssetSymbol}**\n` +
-      `Size: **${amount} ${market.baseAssetSymbol}**\n\n` +
-      `[View on Explorer](${explorerUrl})`,
-      { parse_mode: 'Markdown' }
+      message,
+      {
+        parse_mode: 'Markdown',
+        reply_markup: {
+          inline_keyboard: buildDriftMainKeyboard(),
+        },
+      }
     );
 
   } catch (error) {
     console.error('Open position error:', error);
+    
+    // Update records on failure
+    if (orderRecord) {
+      await driftDatabaseService.updateOrderStatus(orderRecord.id, {
+        status: 'FAILED'
+      });
+    }
+    
+    if (txRecord) {
+      await driftDatabaseService.updateTransaction(txRecord.id, {
+        status: 'FAILED',
+        errorMessage: (error as Error).message,
+        errorType: classifyError(error)
+      });
+    }
+    
     sessionManager.clearFlow(userId);
     await bot.sendMessage(
       chatId,
@@ -349,4 +470,17 @@ async function executeOpenPosition(
       `Please try again or contact support.`
     );
   }
+}
+
+// Error classification helper
+function classifyError(error: any): string {
+  const msg = error?.message?.toLowerCase() || '';
+  
+  if (msg.includes('insufficient')) return 'INSUFFICIENT_BALANCE';
+  if (msg.includes('timeout')) return 'TIMEOUT';
+  if (msg.includes('network')) return 'NETWORK_ERROR';
+  if (msg.includes('rpc')) return 'RPC_ERROR';
+  if (msg.includes('privy')) return 'PRIVY_ERROR';
+  
+  return 'UNKNOWN';
 }

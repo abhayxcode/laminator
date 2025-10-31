@@ -28,7 +28,7 @@ export class FlashService {
     const rpcUrl = process.env.RPC_URL || 'https://api.mainnet-beta.solana.com';
     const pythnetUrl = process.env.PYTHNET_URL || 'https://pythnet.rpcpool.com';
     const connection = new Connection(rpcUrl, 'confirmed');
-    // Use an in-memory wallet to avoid requiring ANCHOR_WALLET for read-only ops
+    // Placeholder wallet for AnchorProvider initialization only (read-only operations)
     const wallet = new Wallet(Keypair.generate());
     this.provider = new AnchorProvider(connection, wallet, {
       commitment: 'processed', preflightCommitment: 'processed', skipPreflight: true,

@@ -8,6 +8,8 @@ import { safeEditMessage } from '../callbackQueryRouter';
 import { buildDriftMainKeyboard } from '../../keyboards/driftKeyboards';
 import { DriftBalanceInfo, formatUSD } from '../../types/drift.types';
 import { driftService } from '../../services/driftService';
+import { dexManager } from '../../services/dexManager';
+import { privyService } from '../../services/privyService';
 
 /**
  * Handle balance action
@@ -20,56 +22,97 @@ export async function handleBalance(
   params: string[]
 ): Promise<void> {
   try {
-    // Get collateral info from driftService
-    const collateral = await driftService.getUserCollateral(chatId);
+    // Get wallet address
+    const walletAddress = await privyService.getWalletAddress(chatId);
 
-    // Get spot positions (token breakdown)
-    const spotPositions = await driftService.getSpotPositions(chatId);
+    // Get wallet balances (SOL, USDC) - fetch in parallel with Drift balance
+    const [walletBalances, balanceInfo] = await Promise.all([
+      Promise.all([
+        dexManager.getWalletSolBalance(chatId).catch(() => 0),
+        dexManager.getWalletUsdcBalance(chatId).catch(() => 0),
+      ]),
+      driftService.getUserBalanceInfo(chatId),
+    ]);
 
-    // Convert to DriftBalanceInfo format
-    const balance: DriftBalanceInfo = {
-      totalCollateral: collateral.total,
-      freeCollateral: collateral.free,
-      usedCollateral: collateral.used,
-      accountValue: collateral.total,
-      leverage: collateral.used > 0 ? collateral.total / (collateral.total - collateral.used) : 1,
-      health: collateral.total > 0 ? (collateral.free / collateral.total) * 100 : 100,
-      maintenanceMargin: collateral.used * 0.1, // Simplified estimate
-      canBeLiquidated: collateral.free < collateral.used * 0.1,
-      tokens: spotPositions.map((pos: any) => ({
-        marketIndex: pos.marketIndex,
-        symbol: pos.symbol,
-        amount: pos.balance,
-        valueUsd: pos.value,
-        isDeposit: true,
-      })),
-    };
+    const walletSol = walletBalances[0];
+    const walletUsdc = walletBalances[1];
+    const collateral = balanceInfo.collateral;
+    const spotPositions = balanceInfo.spotPositions;
 
-    const healthEmoji = balance.health >= 75 ? '🟢' : balance.health >= 50 ? '🟡' : '🔴';
+    // Calculate metrics
+    const totalCollateral = collateral.total;
+    const freeCollateral = collateral.free;
+    const usedCollateral = collateral.used;
+    const accountValue = totalCollateral;
 
-    let message = `*💵 Drift Balance*\n\n`;
+    // Calculate leverage: total collateral / (total collateral - used collateral)
+    const leverage = usedCollateral > 0 && totalCollateral > usedCollateral 
+      ? totalCollateral / (totalCollateral - usedCollateral) 
+      : 1;
 
-    if (balance.totalCollateral === 0) {
+    // Calculate health: free collateral / total collateral * 100
+    const health = totalCollateral > 0 ? (freeCollateral / totalCollateral) * 100 : 100;
+
+    // Estimate maintenance margin (typically ~10% of used collateral)
+    const maintenanceMargin = usedCollateral * 0.1;
+
+    const healthEmoji = health >= 75 ? '🟢' : health >= 50 ? '🟡' : '🔴';
+
+    let message = `*💵 Balance Overview*\n\n`;
+
+    // Wallet address
+    if (walletAddress) {
+      message += `📍 Wallet: \`${walletAddress}\`\n\n`;
+    }
+
+    // Wallet Balances Section
+    message += `*💼 Wallet Balances:*\n`;
+    message += `💰 SOL: ${walletSol.toFixed(9)} SOL\n`;
+    message += `💰 USDC: ${walletUsdc.toFixed(2)} USDC\n\n`;
+
+    // Drift Balance Section
+    message += `*🏦 Drift Protocol Balances:*\n\n`;
+
+    if (totalCollateral === 0) {
       message += `No collateral deposited yet.\n\n`;
       message += `Use *Deposit* to add funds to your Drift account!`;
     } else {
-      message += `💰 Total Collateral: ${formatUSD(balance.totalCollateral)}\n`;
-      message += `✅ Free Collateral: ${formatUSD(balance.freeCollateral)}\n`;
-      message += `🔒 Used Collateral: ${formatUSD(balance.usedCollateral)}\n`;
-      message += `📊 Account Value: ${formatUSD(balance.accountValue)}\n\n`;
-      message += `📈 Leverage: ${balance.leverage.toFixed(2)}x\n`;
-      message += `${healthEmoji} Health: ${balance.health.toFixed(0)}%\n`;
-      message += `⚠️ Maintenance Margin: ${formatUSD(balance.maintenanceMargin)}\n`;
+      message += `💰 Total Collateral: ${formatUSD(totalCollateral)}\n`;
+      message += `✅ Free Collateral: ${formatUSD(freeCollateral)}\n`;
+      message += `🔒 Used Collateral: ${formatUSD(usedCollateral)}\n`;
+      message += `📊 Account Value: ${formatUSD(accountValue)}\n\n`;
+      
+      message += `📈 Leverage: ${leverage.toFixed(2)}x\n`;
+      message += `${healthEmoji} Health: ${health.toFixed(0)}%\n`;
+      message += `⚠️ Maintenance Margin: ${formatUSD(maintenanceMargin)}\n`;
 
-      if (balance.tokens.length > 0) {
-        message += `\n*Token Balances:*\n`;
-        balance.tokens.forEach(token => {
-          message += `\n${token.symbol}: ${token.amount.toFixed(4)} (${formatUSD(token.valueUsd)})`;
+      // Token Balances Section
+      if (spotPositions.length > 0) {
+        message += `\n*📊 Token Balances:*\n`;
+        spotPositions.forEach((pos: any) => {
+          const tokenAmount = pos.balance || 0;
+          const usdValue = pos.valueUsd || 0;
+          
+          // Format balance based on token type
+          let formattedBalance: string;
+          if (pos.symbol === 'SOL') {
+            // For SOL, format with appropriate decimals (up to 9, remove trailing zeros)
+            formattedBalance = tokenAmount.toFixed(9).replace(/\.?0+$/, '');
+          } else if (pos.symbol === 'USDC' || pos.symbol.includes('USDC')) {
+            formattedBalance = tokenAmount.toFixed(2);
+          } else {
+            formattedBalance = tokenAmount.toFixed(4).replace(/\.?0+$/, '');
+          }
+          
+          message += `\n${pos.symbol}: ${formattedBalance} (${formatUSD(usdValue)})`;
         });
+      } else {
+        message += `\n*Token Balances:*\nNo token positions`;
       }
     }
 
     await safeEditMessage(bot, chatId, messageId, message, {
+      parse_mode: 'Markdown',
       reply_markup: {
         inline_keyboard: buildDriftMainKeyboard(),
       },

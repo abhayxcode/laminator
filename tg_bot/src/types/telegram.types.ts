@@ -27,6 +27,7 @@ export enum DriftAction {
   BALANCE = 'balance',
   SETTINGS = 'settings',
   REFRESH = 'refresh',
+  WALLET = 'wallet',
 }
 
 /**

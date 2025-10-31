@@ -53,6 +53,7 @@ class JupiterPerpsServiceImpl {
   }
 
   async initialize(): Promise<void> {
+    // Placeholder wallet for AnchorProvider initialization only (read-only operations)
     const provider = new AnchorProvider(this.connection, new Wallet(Keypair.generate()), AnchorProvider.defaultOptions());
     this.dovesProgram = new Program<Doves>(DovesIDL as any, DOVES_PROGRAM_ID, provider);
     this.initialized = true;
@@ -61,6 +62,7 @@ class JupiterPerpsServiceImpl {
   private async ensureInit(): Promise<void> {
     if (this.initialized && this.dovesProgram) return;
     try {
+      // Placeholder wallet for AnchorProvider initialization only (read-only operations)
       const provider = new AnchorProvider(this.connection, new Wallet(Keypair.generate()), AnchorProvider.defaultOptions());
       this.dovesProgram = new Program<Doves>(DovesIDL as any, DOVES_PROGRAM_ID, provider);
       this.initialized = true;
@@ -92,6 +94,7 @@ class JupiterPerpsServiceImpl {
     await this.ensureInit();
     let program = this.dovesProgram;
     if (!program) {
+      // Placeholder wallet for AnchorProvider initialization only (read-only operations)
       const provider = new AnchorProvider(this.connection, new Wallet(Keypair.generate()), AnchorProvider.defaultOptions());
       program = new Program<Doves>(DovesIDL as any, DOVES_PROGRAM_ID, provider);
     }
@@ -156,6 +159,7 @@ class JupiterPerpsServiceImpl {
     await this.ensureInit();
     let program = this.dovesProgram;
     if (!program) {
+      // Placeholder wallet for AnchorProvider initialization only (read-only operations)
       const provider = new AnchorProvider(this.connection, new Wallet(Keypair.generate()), AnchorProvider.defaultOptions());
       program = new Program<Doves>(DovesIDL as any, DOVES_PROGRAM_ID, provider);
     }

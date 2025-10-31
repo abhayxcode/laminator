@@ -31,8 +31,7 @@ enum WalletType {
 
 enum ChainType {
   SOLANA
-  ETHEREUM
-  POLYGON
+  // Solana-only: No Ethereum/EVM support in this bot
 }
 
 enum WalletStatus {
@@ -153,6 +152,9 @@ model User {
   alerts            Alert[]
   userSettings      UserSetting[]
   auditLogs         AuditLog[]
+  driftOrders       DriftOrder[]
+  driftPositions    DriftPosition[]
+  driftTransactions DriftTransaction[]
 
   // Indexes
   @@index([telegramId])
@@ -175,11 +177,14 @@ model Wallet {
   metadata        Json         @default("{}")
 
   // Relations
-  user            User         @relation(fields: [userId], references: [id], onDelete: Cascade)
-  walletBalances  WalletBalance[]
-  orders          Order[]
-  positions       Position[]
-  transactions    Transaction[]
+  user              User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  walletBalances    WalletBalance[]
+  orders            Order[]
+  positions         Position[]
+  transactions      Transaction[]
+  driftOrders       DriftOrder[]
+  driftPositions    DriftPosition[]
+  driftTransactions DriftTransaction[]
 
   // Indexes
   @@index([userId])
@@ -385,4 +390,203 @@ model AuditLog {
   @@index([resourceType, resourceId])
   @@index([createdAt])
   @@map("audit_logs")
+}
+
+// ==============================================
+// DRIFT-SPECIFIC MODELS
+// ==============================================
+
+model DriftMarket {
+  id               String       @id @default(uuid())
+  marketIndex      Int          @unique @map("market_index")
+  symbol           String       @unique
+  baseAsset        String       @map("base_asset")
+  quoteAsset       String       @default("USD") @map("quote_asset")
+  marketType       String       @default("PERPETUAL") @map("market_type")
+  category         String?
+  
+  // Market Config
+  minOrderSize     Decimal?     @map("min_order_size") @db.Decimal(36, 18)
+  maxOrderSize     Decimal?     @map("max_order_size") @db.Decimal(36, 18)
+  tickSize         Decimal?     @map("tick_size") @db.Decimal(36, 18)
+  stepSize         Decimal?     @map("step_size") @db.Decimal(36, 18)
+  maxLeverage      Decimal?     @map("max_leverage") @db.Decimal(8, 2)
+  
+  // Market State
+  oracleSource     String?      @map("oracle_source")
+  status           String       @default("ACTIVE")
+  
+  // Metadata
+  createdAt        DateTime     @default(now()) @map("created_at")
+  updatedAt        DateTime     @updatedAt @map("updated_at")
+  metadata         Json         @default("{}")
+
+  // Relations
+  orders           DriftOrder[]
+  positions        DriftPosition[]
+
+  @@index([symbol])
+  @@index([marketIndex])
+  @@index([status])
+  @@map("drift_markets")
+}
+
+model DriftOrder {
+  id               String       @id @default(uuid())
+  userId           String       @map("user_id")
+  walletId         String       @map("wallet_id")
+  marketId         String       @map("market_id")
+  
+  // Drift-specific IDs
+  driftOrderId     String?      @map("drift_order_id")
+  driftUserAccount String?      @map("drift_user_account")
+  
+  // Order Details
+  marketIndex      Int          @map("market_index")
+  orderType        String       @map("order_type")
+  side             String
+  direction        String
+  
+  // Amounts
+  baseAssetAmount  Decimal      @map("base_asset_amount") @db.Decimal(36, 18)
+  price            Decimal?     @db.Decimal(36, 18)
+  triggerPrice     Decimal?     @map("trigger_price") @db.Decimal(36, 18)
+  
+  // Leverage & Margin
+  leverage         Decimal      @default(1.0) @db.Decimal(8, 2)
+  reduceOnly       Boolean      @default(false) @map("reduce_only")
+  postOnly         Boolean      @default(false) @map("post_only")
+  
+  // Execution Details
+  status           String       @default("PENDING")
+  filledAmount     Decimal      @default(0) @map("filled_amount") @db.Decimal(36, 18)
+  avgFillPrice     Decimal?     @map("avg_fill_price") @db.Decimal(36, 18)
+  totalFees        Decimal      @default(0) @map("total_fees") @db.Decimal(36, 18)
+  
+  // Timestamps
+  createdAt        DateTime     @default(now()) @map("created_at")
+  updatedAt        DateTime     @updatedAt @map("updated_at")
+  filledAt         DateTime?    @map("filled_at")
+  expiresAt        DateTime?    @map("expires_at")
+  
+  // Metadata
+  metadata         Json         @default("{}")
+
+  // Relations
+  user             User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  wallet           Wallet       @relation(fields: [walletId], references: [id], onDelete: Cascade)
+  market           DriftMarket  @relation(fields: [marketId], references: [id])
+
+  @@index([userId, status])
+  @@index([walletId])
+  @@index([marketId])
+  @@index([driftOrderId])
+  @@index([createdAt])
+  @@map("drift_orders")
+}
+
+model DriftPosition {
+  id               String       @id @default(uuid())
+  userId           String       @map("user_id")
+  walletId         String       @map("wallet_id")
+  marketId         String       @map("market_id")
+  
+  // Drift-specific IDs
+  driftUserAccount String?      @map("drift_user_account")
+  
+  // Position Details
+  marketIndex      Int          @map("market_index")
+  side             String
+  
+  // Amounts
+  baseAssetAmount  Decimal      @map("base_asset_amount") @db.Decimal(36, 18)
+  quoteAssetAmount Decimal      @map("quote_asset_amount") @db.Decimal(36, 18)
+  
+  // Entry Details
+  entryPrice       Decimal      @map("entry_price") @db.Decimal(36, 18)
+  lastPrice        Decimal?     @map("last_price") @db.Decimal(36, 18)
+  markPrice        Decimal?     @map("mark_price") @db.Decimal(36, 18)
+  
+  // Leverage & Margin
+  leverage         Decimal      @default(1.0) @db.Decimal(8, 2)
+  marginAmount     Decimal      @map("margin_amount") @db.Decimal(36, 18)
+  
+  // PnL Tracking
+  unrealizedPnl    Decimal      @default(0) @map("unrealized_pnl") @db.Decimal(36, 18)
+  realizedPnl      Decimal      @default(0) @map("realized_pnl") @db.Decimal(36, 18)
+  
+  // Risk Metrics
+  liquidationPrice Decimal?     @map("liquidation_price") @db.Decimal(36, 18)
+  
+  // Status
+  status           String       @default("OPEN")
+  
+  // Timestamps
+  openedAt         DateTime     @default(now()) @map("opened_at")
+  closedAt         DateTime?    @map("closed_at")
+  updatedAt        DateTime     @updatedAt @map("updated_at")
+  
+  // Metadata
+  metadata         Json         @default("{}")
+
+  // Relations
+  user             User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  wallet           Wallet       @relation(fields: [walletId], references: [id], onDelete: Cascade)
+  market           DriftMarket  @relation(fields: [marketId], references: [id])
+
+  @@unique([userId, marketIndex, status])
+  @@index([userId, status])
+  @@index([walletId])
+  @@index([marketId])
+  @@index([status])
+  @@map("drift_positions")
+}
+
+model DriftTransaction {
+  id               String       @id @default(uuid())
+  userId           String       @map("user_id")
+  walletId         String       @map("wallet_id")
+  
+  // Transaction Details
+  txHash           String?      @unique @map("tx_hash")
+  txType           String       @map("tx_type")
+  status           String       @default("PENDING")
+  
+  // Related Records
+  orderId          String?      @map("order_id")
+  positionId       String?      @map("position_id")
+  marketIndex      Int?         @map("market_index")
+  
+  // Amounts
+  amount           Decimal?     @db.Decimal(36, 18)
+  tokenSymbol      String?      @map("token_symbol")
+  
+  // Blockchain Details
+  blockNumber      BigInt?      @map("block_number")
+  blockTimestamp   DateTime?    @map("block_timestamp")
+  gasFee           Decimal?     @map("gas_fee") @db.Decimal(36, 18)
+  
+  // Retry Tracking
+  retryCount       Int          @default(0) @map("retry_count")
+  errorMessage     String?      @map("error_message")
+  errorType        String?      @map("error_type")
+  
+  // Timestamps
+  createdAt        DateTime     @default(now()) @map("created_at")
+  updatedAt        DateTime     @updatedAt @map("updated_at")
+  confirmedAt      DateTime?    @map("confirmed_at")
+  
+  // Metadata
+  metadata         Json         @default("{}")
+
+  // Relations
+  user             User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  wallet           Wallet       @relation(fields: [walletId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@index([walletId])
+  @@index([txHash])
+  @@index([status])
+  @@index([txType])
+  @@map("drift_transactions")
 }

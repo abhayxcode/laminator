@@ -5,6 +5,7 @@ import {
   PerpMarkets,
   PerpMarketConfig,
   UserAccount,
+  User,
   isVariant,
   convertToNumber,
   BN,
@@ -25,7 +26,18 @@ import {
   PollingDriftClientAccountSubscriber,
   BulkAccountLoader,
   QUOTE_PRECISION,
-  PRICE_PRECISION
+  PRICE_PRECISION,
+  BASE_PRECISION,
+  getUserAccountPublicKey,
+  decodeUser,
+  calculatePositionPNL,
+  calculateEntryPrice,
+  decodeName,
+  SpotBalanceType,
+  getTokenAmount,
+  getTokenValue,
+  SPOT_MARKET_CUMULATIVE_INTEREST_PRECISION,
+  QUOTE_SPOT_MARKET_INDEX
 } from '@drift-labs/sdk';
 import { 
   Connection as SolanaConnection, 
@@ -34,6 +46,7 @@ import {
   clusterApiUrl,
   LAMPORTS_PER_SOL
 } from '@solana/web3.js';
+import { NATIVE_MINT } from '@solana/spl-token';
 import { privyService } from './privyService';
 import { databaseService } from './databaseService';
 
@@ -51,6 +64,7 @@ export interface PerpMarket {
 }
 
 export interface UserPosition {
+  marketIndex: number;
   symbol: string;
   side: 'long' | 'short';
   size: number;
@@ -73,6 +87,9 @@ export class DriftService {
   private dlobSubscriber: DLOBSubscriber | null = null;
   private orderSubscriber: OrderSubscriber | null = null;
   private initialized: boolean = false;
+  private marketsCache: PerpMarket[] | null = null;
+  private marketsCacheTime: number = 0;
+  private readonly CACHE_DURATION = 5 * 60 * 1000; // 5 minutes cache
 
   constructor(rpcUrl?: string) {
     // Use a reliable public RPC endpoint
@@ -121,10 +138,15 @@ export class DriftService {
 
         private async getDriftClientForMarketData(): Promise<DriftClient | null> {
           try {
-            // Create a minimal client just for market data fetching (no wallet needed for read operations)
+            // Create a minimal client for market data fetching
+            // DriftClient requires a wallet for initialization, but we only use it for market data
+            // Instructions are built directly with user's accounts, not through DriftClient methods
             if (!this.driftClient) {
-              const dummyKeypair = Keypair.generate();
-              const wallet = new Wallet(dummyKeypair);
+              // Create a minimal wallet only for DriftClient initialization (required by SDK for market data)
+              // This wallet is NEVER used for signing or building user instructions
+              // All instructions are built directly with user's accounts via program.instruction methods
+              const minimalKeypair = Keypair.generate();
+              const wallet = new Wallet(minimalKeypair);
               
               // Prefer websocket subscription to avoid Helius batch limitations
               try {
@@ -213,38 +235,19 @@ export class DriftService {
 
       console.log(`📍 User wallet address: ${walletAddress}`);
 
-      // Get user's private key from Privy (for transaction signing)
-      const privateKey = await privyService.getWalletPrivateKey(telegramUserId);
-      
-      if (!privateKey) {
-        console.warn('⚠️ Private key not available, using read-only client');
-        // Return read-only client for market data operations
-        const marketClient = await this.getDriftClientForMarketData();
-        if (!marketClient) {
-          throw new Error('Drift client not available for market data');
-        }
-        return marketClient;
+      // Privy server wallets don't support getWalletPrivateKey()
+      // We use a read-only client that can still access user account data
+      // Transactions are signed separately through Privy's signTransaction API
+      const driftClient = await this.getDriftClientForMarketData();
+      if (!driftClient) {
+        throw new Error('Drift client not available for market data');
       }
 
-      // Create keypair from private key
-      const keypair = Keypair.fromSecretKey(Buffer.from(privateKey, 'hex'));
-      const wallet = new Wallet(keypair);
-
-      // Create Drift client with user's actual wallet
-      const driftClient = new DriftClient({
-        connection: this.connection,
-        wallet,
-        env: 'mainnet-beta',
-        accountSubscription: {
-          type: 'websocket',
-          resubTimeoutMs: 30000,
-        },
-      });
-
-      // Subscribe to Drift program accounts
-      await driftClient.subscribe();
-
-      console.log(`✅ Created Drift client with user's Privy wallet`);
+      // Privy server wallets only support signTransaction()
+      // Instructions are built directly with user's accounts, not through DriftClient wallet
+      // User account data will be loaded on-demand when needed
+      
+      console.log(`✅ Created Drift client for market data access (user-specific instructions built separately)`);
       return driftClient;
     } catch (error) {
       console.error('❌ Failed to create Drift client for user:', error);
@@ -257,27 +260,39 @@ export class DriftService {
       throw new Error('Drift service not initialized');
     }
 
+    // Return cached markets if still valid
+    const now = Date.now();
+    if (this.marketsCache && (now - this.marketsCacheTime) < this.CACHE_DURATION) {
+      console.log(`📦 Using cached Drift markets (${this.marketsCache.length} markets, age: ${Math.floor((now - this.marketsCacheTime) / 1000)}s)`);
+      return this.marketsCache;
+    }
+
     if (process.env.HELIUS_API_KEY || process.env.SOLANA_RPC_URL) {
       try {
         console.log('📊 Fetching real market data from Drift Protocol SDK...');
-        
+
         const driftClient = await this.getDriftClientForMarketData();
-        
+
         if (!driftClient) {
           console.warn('❌ Drift client not available (likely due to RPC limitations)');
+          // If we have stale cache, return it instead of throwing
+          if (this.marketsCache) {
+            console.log('⚠️ Returning stale cached markets due to RPC unavailability');
+            return this.marketsCache;
+          }
           throw new Error('Drift client not available');
         }
-        
+
         const markets: PerpMarket[] = [];
-        
+
         // Log available Drift markets for debugging
         console.log(`📋 Available Drift markets: ${PerpMarkets['mainnet-beta'].length} markets`);
         console.log(`📋 Market symbols: ${PerpMarkets['mainnet-beta'].map(m => m.symbol).join(', ')}`);
-        
+
         for (const marketConfig of PerpMarkets['mainnet-beta']) {
           try {
             const perpMarketAccount = driftClient.getPerpMarketAccount(marketConfig.marketIndex);
-            
+
             if (!perpMarketAccount) {
               console.warn(`Market ${marketConfig.symbol} not found`);
               continue;
@@ -292,7 +307,7 @@ export class DriftService {
 
             // Extract base asset from symbol (e.g., "SOL-PERP" -> "SOL")
             const baseAsset = marketConfig.symbol.replace('-PERP', '');
-            
+
             markets.push({
               symbol: baseAsset, // Show as "SOL" instead of "SOL-PERP"
               marketIndex: marketConfig.marketIndex,
@@ -313,16 +328,80 @@ export class DriftService {
         }
 
         if (markets.length > 0) {
-          console.log(`✅ Fetched ${markets.length} real markets from Drift Protocol SDK`);
+          // Cache the results
+          this.marketsCache = markets;
+          this.marketsCacheTime = now;
+          console.log(`✅ Fetched and cached ${markets.length} real markets from Drift Protocol SDK`);
           return markets;
+        }
+
+        // If we couldn't fetch any markets but have old cache, use it
+        if (this.marketsCache) {
+          console.warn('⚠️ Failed to fetch fresh markets, using stale cache');
+          return this.marketsCache;
         }
       } catch (error) {
         console.error('❌ Failed to get available markets from Drift API:', error);
+        // If we have cached data, return it even if stale
+        if (this.marketsCache) {
+          console.warn('⚠️ Error fetching markets, using cached data');
+          return this.marketsCache;
+        }
       }
     }
 
     // No external fallback; respect real-time only policy
     throw new Error('Drift markets unavailable due to RPC limitations');
+  }
+
+  /**
+   * Fetch and deserialize user account directly from chain
+   * Does not use DriftClient's getUserAccount() method
+   */
+  private async fetchUserAccountDirectly(
+    userPublicKey: SolanaPublicKey,
+    subAccountId: number = 0
+  ): Promise<UserAccount | null> {
+    try {
+      const driftClient = await this.getDriftClientForMarketData();
+      if (!driftClient) return null;
+
+      const programId = (driftClient as any).program?.programId;
+      if (!programId) return null;
+
+      // Get user account PDA
+      const userAccountPublicKey = await getUserAccountPublicKey(programId, userPublicKey, subAccountId);
+      
+      // Fetch account info directly from chain
+      const accountInfo = await this.connection.getAccountInfo(userAccountPublicKey);
+      
+      if (!accountInfo || !accountInfo.data) {
+        return null;
+      }
+
+      // Deserialize the user account data
+      try {
+        const userAccount = decodeUser(accountInfo.data);
+        return userAccount;
+      } catch (error) {
+        console.warn('Failed to deserialize user account:', error);
+        return null;
+      }
+    } catch (error) {
+      console.error('Error fetching user account directly:', error);
+      return null;
+    }
+  }
+
+  /**
+   * Load user account data on-demand for a specific user (legacy method - kept for compatibility)
+   */
+  private async loadUserAccount(
+    driftClient: DriftClient,
+    userPublicKey: SolanaPublicKey
+  ): Promise<UserAccount | null> {
+    // Use direct fetch instead of DriftClient
+    return this.fetchUserAccountDirectly(userPublicKey, 0);
   }
 
   async getUserPositions(telegramUserId: number): Promise<UserPosition[]> {
@@ -333,11 +412,19 @@ export class DriftService {
     try {
       console.log(`🔍 Fetching positions for Telegram user: ${telegramUserId}`);
       
-      // Get Drift client with user's Privy wallet
+      // Get user's wallet address
+      const walletAddress = await privyService.getWalletAddress(telegramUserId);
+      if (!walletAddress) {
+        throw new Error('User wallet not found in Privy');
+      }
+
+      const userPublicKey = new SolanaPublicKey(walletAddress);
+      
+      // Get Drift client
       const driftClient = await this.getDriftClientForUser(telegramUserId);
       
-      // Get user account from Drift
-      const userAccount = driftClient.getUserAccount();
+      // Load user account data
+      const userAccount = await this.loadUserAccount(driftClient, userPublicKey);
       if (!userAccount) {
         console.log('No user account found in Drift');
         return [];
@@ -361,26 +448,53 @@ export class DriftService {
           continue;
         }
 
-        // Get current price
+        // Get perp market account and oracle data
+        const perpMarketAccount = driftClient.getPerpMarketAccount(position.marketIndex);
         const oraclePriceData = driftClient.getOracleDataForPerpMarket(position.marketIndex);
         const currentPrice = oraclePriceData ? convertToNumber(oraclePriceData.price, PRICE_PRECISION) : 0;
 
-        // Calculate position size and direction
-        const baseAssetAmount = convertToNumber(position.baseAssetAmount, new BN(9)); // SOL has 9 decimals
+        // Calculate position size and direction using BASE_PRECISION
+        const baseAssetAmount = convertToNumber(position.baseAssetAmount, BASE_PRECISION);
         const isLong = baseAssetAmount > 0;
         const size = Math.abs(baseAssetAmount);
         
-        // Calculate entry price
-        const entryPrice = convertToNumber(position.lastCumulativeFundingRate, PRICE_PRECISION);
+        // Calculate entry price using SDK helper
+        let entryPrice = 0;
+        try {
+          const calculatedEntryPrice = calculateEntryPrice(position);
+          entryPrice = convertToNumber(calculatedEntryPrice, PRICE_PRECISION);
+        } catch (error) {
+          // Fallback: calculate from quote asset amount
+          const quoteAssetAmount = convertToNumber(position.quoteAssetAmount, QUOTE_PRECISION);
+          if (baseAssetAmount !== 0) {
+            entryPrice = Math.abs(quoteAssetAmount / baseAssetAmount);
+          }
+        }
         
-        // Calculate unrealized PnL
-        const unrealizedPnl = convertToNumber(position.quoteAssetAmount, QUOTE_PRECISION);
+        // Calculate unrealized PnL using SDK helper
+        let unrealizedPnl = 0;
+        try {
+          if (perpMarketAccount && oraclePriceData) {
+            const pnl = calculatePositionPNL(
+              perpMarketAccount,
+              position,
+              false, // withFunding
+              oraclePriceData
+            );
+            unrealizedPnl = convertToNumber(pnl, QUOTE_PRECISION);
+          }
+        } catch (error) {
+          // Fallback: manual calculation
+          const priceDiff = isLong ? (currentPrice - entryPrice) : (entryPrice - currentPrice);
+          unrealizedPnl = priceDiff * size;
+        }
         
-        // Calculate margin
-        const margin = convertToNumber(position.lastCumulativeFundingRate, QUOTE_PRECISION);
+        // Calculate margin (quote asset amount represents margin used)
+        const margin = convertToNumber(position.quoteAssetAmount.abs(), QUOTE_PRECISION);
 
         positions.push({
-          symbol: marketConfig.symbol,
+          marketIndex: position.marketIndex,
+          symbol: marketConfig.baseAssetSymbol || marketConfig.symbol.replace('-PERP', ''),
           side: isLong ? 'long' : 'short',
           size: size,
           entryPrice: entryPrice,
@@ -611,60 +725,131 @@ export class DriftService {
     try {
       console.log(`🎯 Opening ${side} position for ${symbol} with size ${size} for user ${telegramUserId}`);
       
-      // Get Drift client with user's Privy wallet
-      const driftClient = await this.getDriftClientForUser(telegramUserId);
+      // Get user's wallet address
+      const walletAddress = await privyService.getWalletAddress(telegramUserId);
+      if (!walletAddress) {
+        throw new Error('User wallet not found in Privy');
+      }
+
+      const userPublicKey = new SolanaPublicKey(walletAddress);
       
-      // Find market config
-      const marketConfig = PerpMarkets['mainnet-beta'].find(m => m.symbol === symbol.toUpperCase());
+      // Find market config - handle both "SOL" and "SOL-PERP" formats
+      const symbolUpper = symbol.toUpperCase();
+      const searchSymbol = symbolUpper.includes('-PERP') ? symbolUpper : `${symbolUpper}-PERP`;
+      const marketConfig = PerpMarkets['mainnet-beta'].find(
+        m => m.symbol === searchSymbol || m.baseAssetSymbol === symbolUpper
+      );
       if (!marketConfig) {
         throw new Error(`Market ${symbol} not found`);
       }
 
-      // TODO: Implement actual position opening with Drift SDK
-      // This requires:
-      // 1. Building the position opening instruction
-      // 2. Creating and sending transaction
-      // 3. Handling transaction confirmation
-      
-      console.log('⚠️ Position opening with real transaction signing not implemented yet');
-      console.log('✅ Market validation passed, Privy wallet integration ready');
-      
-      // For now, return a placeholder
-      return `mock_tx_${Date.now()}_${symbol}_${side}`;
+      // Get Drift client
+      const driftClient = await this.getDriftClientForMarketData();
+      if (!driftClient) {
+        throw new Error('Drift client not available');
+      }
+
+      // Convert size to BN with BASE_PRECISION
+      const sizeBN = new BN(size).mul(BASE_PRECISION);
+
+      // Import transaction service
+      const { createDriftTransactionService } = await import('./driftTransactionService');
+      const txService = createDriftTransactionService(driftClient, this.connection);
+
+      // Build open position transaction
+      const transaction = await txService.buildOpenPositionTransaction(
+        userPublicKey,
+        marketConfig.marketIndex,
+        side,
+        sizeBN,
+        'market' // default to market orders
+      );
+
+      // Sign and send transaction using Privy signing service
+      const { privySigningService } = await import('./privySigningService');
+      const signature = await privySigningService.signAndSendTransactionWithRetry(
+        telegramUserId,
+        transaction,
+        this.connection
+      );
+
+      console.log(`✅ Position opened successfully: ${signature}`);
+      return signature;
     } catch (error) {
       console.error('❌ Failed to open position:', error);
       throw error;
     }
   }
 
-  async closePosition(telegramUserId: number, symbol: string): Promise<string> {
+  async closePosition(
+    telegramUserId: number,
+    symbol: string,
+    percentage: number = 100
+  ): Promise<string> {
     if (!this.initialized) {
       throw new Error('Drift service not initialized');
     }
 
     try {
-      console.log(`🔒 Closing position for ${symbol} for user ${telegramUserId}`);
+      console.log(`🔒 Closing ${percentage}% of position for ${symbol} for user ${telegramUserId}`);
       
-      // Get Drift client with user's Privy wallet
-      const driftClient = await this.getDriftClientForUser(telegramUserId);
+      // Get user's wallet address
+      const walletAddress = await privyService.getWalletAddress(telegramUserId);
+      if (!walletAddress) {
+        throw new Error('User wallet not found in Privy');
+      }
+
+      const userPublicKey = new SolanaPublicKey(walletAddress);
       
-      // Find market config
-      const marketConfig = PerpMarkets['mainnet-beta'].find(m => m.symbol === symbol.toUpperCase());
+      // Find market config - handle both "SOL" and "SOL-PERP" formats
+      const symbolUpper = symbol.toUpperCase();
+      const searchSymbol = symbolUpper.includes('-PERP') ? symbolUpper : `${symbolUpper}-PERP`;
+      const marketConfig = PerpMarkets['mainnet-beta'].find(
+        m => m.symbol === searchSymbol || m.baseAssetSymbol === symbolUpper
+      );
       if (!marketConfig) {
         throw new Error(`Market ${symbol} not found`);
       }
 
-      // TODO: Implement actual position closing with Drift SDK
-      // This requires:
-      // 1. Finding the user's open position for this market
-      // 2. Building the position closing instruction
-      // 3. Creating and sending transaction
-      
-      console.log('⚠️ Position closing with real transaction signing not implemented yet');
-      console.log('✅ Market validation passed, Privy wallet integration ready');
-      
-      // For now, return a placeholder
-      return `mock_close_tx_${Date.now()}_${symbol}`;
+      // Load user account to verify position exists
+      const driftClient = await this.getDriftClientForMarketData();
+      if (!driftClient) {
+        throw new Error('Drift client not available');
+      }
+
+      const userAccount = await this.loadUserAccount(driftClient, userPublicKey);
+      if (!userAccount) {
+        throw new Error('User account not found in Drift');
+      }
+
+      // Find the position for this market
+      const position = userAccount.perpPositions.find(p => p.marketIndex === marketConfig.marketIndex);
+      if (!position || position.baseAssetAmount.eq(new BN(0))) {
+        throw new Error(`No open position found for ${symbol}`);
+      }
+
+      // Import transaction service
+      const { createDriftTransactionService } = await import('./driftTransactionService');
+      const txService = createDriftTransactionService(driftClient, this.connection);
+
+      // Build close position transaction (pass user account data)
+      const transaction = await txService.buildClosePositionTransaction(
+        userPublicKey,
+        marketConfig.marketIndex,
+        percentage,
+        userAccount // Pass user account data
+      );
+
+      // Sign and send transaction using Privy signing service
+      const { privySigningService } = await import('./privySigningService');
+      const signature = await privySigningService.signAndSendTransactionWithRetry(
+        telegramUserId,
+        transaction,
+        this.connection
+      );
+
+      console.log(`✅ Position closed successfully: ${signature}`);
+      return signature;
     } catch (error) {
       console.error('❌ Failed to close position:', error);
       throw error;
@@ -743,11 +928,20 @@ export class DriftService {
     }
 
     try {
-      const driftClient = await this.getDriftClientForUser(telegramUserId);
-      const userAccount = driftClient.getUserAccount();
+      // Get wallet address and fetch user account directly from chain
+      const walletAddress = await privyService.getWalletAddress(telegramUserId);
+      if (!walletAddress) {
+        return 0;
+      }
+
+      const userPublicKey = new SolanaPublicKey(walletAddress);
+      const userAccount = await this.fetchUserAccountDirectly(userPublicKey, 0);
+      
       if (!userAccount) {
         return 0;
       }
+
+      const driftClient = await this.getDriftClientForUser(telegramUserId);
 
       // Approximate total collateral in USDC by summing spot positions balances with USDC price=1
       // This is a simplified representation suitable for display.
@@ -757,7 +951,12 @@ export class DriftService {
         for (const spotMarket of spotMarkets) {
           const pos = driftClient.getSpotPosition ? driftClient.getSpotPosition(spotMarket.marketIndex) : null;
           if (pos && pos.scaledBalance && !pos.scaledBalance.isZero()) {
-            const bal = convertToNumber(pos.scaledBalance, new BN(spotMarket.decimals));
+            const tokenAmountBN = getTokenAmount(
+              pos.scaledBalance,
+              spotMarket,
+              pos.balanceType || SpotBalanceType.DEPOSIT
+            );
+            const bal = convertToNumber(tokenAmountBN, new BN(10).pow(new BN(spotMarket.decimals)));
             // Treat all as USDC-equivalent for a conservative estimate; refine per-market pricing if needed
             totalUSDC += bal;
           }
@@ -820,15 +1019,32 @@ export class DriftService {
 
   /**
    * Check if user has initialized Drift account
+   * Checks both user stats account and user account
    */
   async hasUserAccount(userPublicKey: SolanaPublicKey): Promise<boolean> {
     try {
       const driftClient = await this.getDriftClientForMarketData();
       if (!driftClient) return false;
 
-      const userAccountPubkey = await driftClient.getUserAccountPublicKey(0); // subAccountId = 0
-      const accountInfo = await this.connection.getAccountInfo(userAccountPubkey);
-      return accountInfo !== null;
+      const programId = (driftClient as any).program?.programId;
+      if (!programId) return false;
+
+      // Check user stats account
+      const { getUserStatsAccountPublicKey, getUserAccountPublicKey } = await import('@drift-labs/sdk');
+      const userStatsPDA = getUserStatsAccountPublicKey(programId, userPublicKey);
+      const statsAccountInfo = await this.connection.getAccountInfo(userStatsPDA);
+      
+      // Check user account
+      const userAccountPubkey = await getUserAccountPublicKey(programId, userPublicKey, 0);
+      const userAccountInfo = await this.connection.getAccountInfo(userAccountPubkey);
+      
+      // Both accounts must exist for the user to be fully initialized
+      const statsExists = statsAccountInfo !== null;
+      const accountExists = userAccountInfo !== null;
+      
+      console.log(`🔍 Account check for ${userPublicKey.toBase58()}: stats=${statsExists}, account=${accountExists}`);
+      
+      return statsExists && accountExists;
     } catch (error) {
       console.error('Error checking user account:', error);
       return false;
@@ -840,8 +1056,14 @@ export class DriftService {
    */
   async getUserAccountData(telegramUserId: number): Promise<UserAccount | null> {
     try {
-      const driftClient = await this.getDriftClientForUser(telegramUserId);
-      return driftClient.getUserAccount() || null;
+      // Get wallet address and fetch user account directly from chain
+      const walletAddress = await privyService.getWalletAddress(telegramUserId);
+      if (!walletAddress) {
+        return null;
+      }
+
+      const userPublicKey = new SolanaPublicKey(walletAddress);
+      return await this.fetchUserAccountDirectly(userPublicKey, 0);
     } catch (error) {
       console.error('Error getting user account data:', error);
       return null;
@@ -883,9 +1105,23 @@ export class DriftService {
    */
   async getUserPositionsWithPnL(telegramUserId: number): Promise<UserPosition[]> {
     try {
+      // Get user's wallet address
+      const walletAddress = await privyService.getWalletAddress(telegramUserId);
+      if (!walletAddress) {
+        console.warn('User wallet not found in Privy');
+        return [];
+      }
+
+      const userPublicKey = new SolanaPublicKey(walletAddress);
+      
+      // Get Drift client
       const driftClient = await this.getDriftClientForUser(telegramUserId);
-      const userAccount = driftClient.getUserAccount();
-      if (!userAccount) return [];
+      
+      // Load user account data
+      const userAccount = await this.loadUserAccount(driftClient, userPublicKey);
+      if (!userAccount) {
+        return [];
+      }
 
       const positions: UserPosition[] = [];
 
@@ -899,27 +1135,54 @@ export class DriftService {
         const oraclePriceData = driftClient.getOracleDataForPerpMarket(position.marketIndex);
         const currentPrice = oraclePriceData ? convertToNumber(oraclePriceData.price, PRICE_PRECISION) : 0;
 
-        // Calculate position size and direction
-        const baseAssetAmount = convertToNumber(position.baseAssetAmount, new BN(9));
+        // Calculate position size and direction using BASE_PRECISION
+        const baseAssetAmount = convertToNumber(position.baseAssetAmount, BASE_PRECISION);
         const isLong = baseAssetAmount > 0;
         const size = Math.abs(baseAssetAmount);
 
-        // Calculate entry price
-        const quoteAssetAmount = convertToNumber(position.quoteAssetAmount, QUOTE_PRECISION);
-        const entryPrice = Math.abs(quoteAssetAmount / baseAssetAmount);
+        // Calculate entry price using SDK helper
+        let entryPrice = 0;
+        try {
+          const calculatedEntryPrice = calculateEntryPrice(position);
+          entryPrice = convertToNumber(calculatedEntryPrice, PRICE_PRECISION);
+        } catch (error) {
+          // Fallback: calculate from quote asset amount
+          const quoteAssetAmount = convertToNumber(position.quoteAssetAmount, QUOTE_PRECISION);
+          if (baseAssetAmount !== 0) {
+            entryPrice = Math.abs(quoteAssetAmount / baseAssetAmount);
+          }
+        }
 
-        // Calculate unrealized PnL
-        const priceDiff = isLong ? (currentPrice - entryPrice) : (entryPrice - currentPrice);
-        const unrealizedPnl = priceDiff * size;
+        // Calculate unrealized PnL using SDK helper
+        let unrealizedPnl = 0;
+        try {
+          if (perpMarketAccount && oraclePriceData) {
+            const pnl = calculatePositionPNL(
+              perpMarketAccount,
+              position,
+              false, // withFunding
+              oraclePriceData
+            );
+            unrealizedPnl = convertToNumber(pnl, QUOTE_PRECISION);
+          }
+        } catch (error) {
+          // Fallback: manual calculation
+          const priceDiff = isLong ? (currentPrice - entryPrice) : (entryPrice - currentPrice);
+          unrealizedPnl = priceDiff * size;
+        }
+
+        // Calculate margin (quote asset amount represents margin used)
+        const margin = convertToNumber(position.quoteAssetAmount.abs(), QUOTE_PRECISION);
 
         positions.push({
-          symbol: marketConfig.symbol,
+          marketIndex: position.marketIndex,
+          symbol: marketConfig.baseAssetSymbol || marketConfig.symbol.replace('-PERP', ''),
           side: isLong ? 'long' : 'short',
           size: size,
           entryPrice: entryPrice,
           currentPrice: currentPrice,
           unrealizedPnl: unrealizedPnl,
-          margin: Math.abs(quoteAssetAmount),
+          margin: margin,
         });
       }
 
@@ -934,43 +1197,298 @@ export class DriftService {
    * Get specific position for a market
    */
   async getUserPosition(telegramUserId: number, marketIndex: number): Promise<UserPosition | null> {
-    const positions = await this.getUserPositionsWithPnL(telegramUserId);
-    return positions.find(p => p.symbol.includes(String(marketIndex))) || null;
+    try {
+      // Get user's wallet address
+      const walletAddress = await privyService.getWalletAddress(telegramUserId);
+      if (!walletAddress) {
+        return null;
+      }
+
+      const userPublicKey = new SolanaPublicKey(walletAddress);
+      
+      // Get Drift client
+      const driftClient = await this.getDriftClientForUser(telegramUserId);
+      
+      // Load user account data
+      const userAccount = await this.loadUserAccount(driftClient, userPublicKey);
+      if (!userAccount) {
+        return null;
+      }
+
+      // Find position for this market index
+      const position = userAccount.perpPositions.find(p => p.marketIndex === marketIndex);
+      if (!position || position.baseAssetAmount.eq(new BN(0))) {
+        return null;
+      }
+
+      // Get market config
+      const marketConfig = PerpMarkets['mainnet-beta'][position.marketIndex];
+      if (!marketConfig) {
+        return null;
+      }
+
+      // Get perp market account and oracle data
+      const perpMarketAccount = driftClient.getPerpMarketAccount(position.marketIndex);
+      const oraclePriceData = driftClient.getOracleDataForPerpMarket(position.marketIndex);
+      const currentPrice = oraclePriceData ? convertToNumber(oraclePriceData.price, PRICE_PRECISION) : 0;
+
+      // Calculate position size and direction
+      const baseAssetAmount = convertToNumber(position.baseAssetAmount, BASE_PRECISION);
+      const isLong = baseAssetAmount > 0;
+      const size = Math.abs(baseAssetAmount);
+
+      // Calculate entry price
+      let entryPrice = 0;
+      try {
+        const calculatedEntryPrice = calculateEntryPrice(position);
+        entryPrice = convertToNumber(calculatedEntryPrice, PRICE_PRECISION);
+      } catch (error) {
+        const quoteAssetAmount = convertToNumber(position.quoteAssetAmount, QUOTE_PRECISION);
+        if (baseAssetAmount !== 0) {
+          entryPrice = Math.abs(quoteAssetAmount / baseAssetAmount);
+        }
+      }
+
+      // Calculate unrealized PnL
+      let unrealizedPnl = 0;
+      try {
+        if (perpMarketAccount && oraclePriceData) {
+          const pnl = calculatePositionPNL(
+            perpMarketAccount,
+            position,
+            false, // withFunding
+            oraclePriceData
+          );
+          unrealizedPnl = convertToNumber(pnl, QUOTE_PRECISION);
+        }
+      } catch (error) {
+        const priceDiff = isLong ? (currentPrice - entryPrice) : (entryPrice - currentPrice);
+        unrealizedPnl = priceDiff * size;
+      }
+
+      // Calculate margin
+      const margin = convertToNumber(position.quoteAssetAmount.abs(), QUOTE_PRECISION);
+
+      return {
+        marketIndex: position.marketIndex,
+        symbol: marketConfig.baseAssetSymbol || marketConfig.symbol.replace('-PERP', ''),
+        side: isLong ? 'long' : 'short',
+        size: size,
+        entryPrice: entryPrice,
+        currentPrice: currentPrice,
+        unrealizedPnl: unrealizedPnl,
+        margin: margin,
+      };
+    } catch (error) {
+      console.error('Error getting user position:', error);
+      return null;
+    }
+  }
+
+  /**
+   * Get user's balance info (collateral + spot positions) in a single fetch
+   * Optimized to fetch user account only once
+   */
+  async getUserBalanceInfo(telegramUserId: number): Promise<{
+    collateral: { total: number; free: number; used: number; availableWithdraw: number };
+    spotPositions: any[];
+  }> {
+    try {
+      // Get wallet address and fetch user account directly from chain ONCE
+      const walletAddress = await privyService.getWalletAddress(telegramUserId);
+      if (!walletAddress) {
+        return {
+          collateral: { total: 0, free: 0, used: 0, availableWithdraw: 0 },
+          spotPositions: []
+        };
+      }
+
+      const userPublicKey = new SolanaPublicKey(walletAddress);
+      const userAccount = await this.fetchUserAccountDirectly(userPublicKey, 0);
+
+      if (!userAccount) {
+        return {
+          collateral: { total: 0, free: 0, used: 0, availableWithdraw: 0 },
+          spotPositions: []
+        };
+      }
+
+      const driftClient = await this.getDriftClientForUser(telegramUserId);
+      const spotMarkets = driftClient.getSpotMarketAccounts();
+
+      // Calculate total collateral and build spot positions in one pass
+      let totalCollateralUSD = 0;
+      const positions: any[] = [];
+
+      for (const spotMarket of spotMarkets) {
+        const position = userAccount.spotPositions.find((p: any) => p.marketIndex === spotMarket.marketIndex);
+        if (!position || position.scaledBalance.isZero()) continue;
+        if (position.balanceType !== undefined && !isVariant(position.balanceType, 'deposit')) continue;
+
+        try {
+          // Use getTokenAmount to get actual token amount (in token's native decimals)
+          const tokenAmountBN = getTokenAmount(
+            position.scaledBalance,
+            spotMarket,
+            position.balanceType || SpotBalanceType.DEPOSIT
+          );
+
+          // Calculate USD value
+          let valueUSD = 0;
+          const oracleData = driftClient.getOracleDataForSpotMarket(spotMarket.marketIndex);
+          if (oracleData && oracleData.price) {
+            const valueBN = getTokenValue(tokenAmountBN, spotMarket.decimals, oracleData);
+            valueUSD = convertToNumber(valueBN, PRICE_PRECISION);
+          } else {
+            // Fallback for markets without oracle
+            const tokenAmount = convertToNumber(tokenAmountBN, new BN(10).pow(new BN(spotMarket.decimals)));
+            if (spotMarket.marketIndex === QUOTE_SPOT_MARKET_INDEX || spotMarket.mint.equals(NATIVE_MINT) === false) {
+              valueUSD = tokenAmount; // USDC or quote market = 1:1
+            } else {
+              // SOL - try to get price from SOL-PERP
+              try {
+                const solOracle = driftClient.getOracleDataForPerpMarket(0);
+                if (solOracle) {
+                  const valueBN = getTokenValue(tokenAmountBN, spotMarket.decimals, solOracle);
+                  valueUSD = convertToNumber(valueBN, PRICE_PRECISION);
+                } else {
+                  valueUSD = tokenAmount; // Fallback
+                }
+              } catch (e) {
+                valueUSD = tokenAmount; // Fallback
+              }
+            }
+          }
+
+          totalCollateralUSD += valueUSD;
+
+          // Decode token name properly
+          let symbol = `SPOT-${spotMarket.marketIndex}`;
+          try {
+            const decodedName = decodeName(spotMarket.name).trim();
+            if (decodedName) {
+              symbol = decodedName.replace('-SPOT', '').toUpperCase();
+            }
+          } catch (e) {
+            console.warn(`Failed to decode name for market ${spotMarket.marketIndex}:`, e);
+          }
+
+          // Get balance amount
+          const balance = convertToNumber(tokenAmountBN, new BN(10).pow(new BN(spotMarket.decimals)));
+
+          positions.push({
+            symbol: symbol,
+            marketIndex: spotMarket.marketIndex,
+            balance: balance,
+            valueUsd: valueUSD,
+          });
+        } catch (e) {
+          console.warn(`Failed to calculate collateral for market ${spotMarket.marketIndex}:`, e);
+        }
+      }
+
+      // Estimate free collateral (conservative: total - estimated margin requirements)
+      const freeCollateral = Math.max(0, totalCollateralUSD * 0.8); // Conservative 80% free
+      const usedCollateral = totalCollateralUSD - freeCollateral;
+
+      return {
+        collateral: {
+          total: totalCollateralUSD,
+          free: freeCollateral,
+          used: usedCollateral,
+          availableWithdraw: freeCollateral,
+        },
+        spotPositions: positions,
+      };
+    } catch (error) {
+      console.error('Error getting user balance info:', error);
+      return {
+        collateral: { total: 0, free: 0, used: 0, availableWithdraw: 0 },
+        spotPositions: []
+      };
+    }
   }
 
   /**
    * Get user's collateral info in Drift
+   * Calculates total collateral from spot positions and estimates free/used
+   * NOTE: For better performance, use getUserBalanceInfo() which fetches account once
    */
   async getUserCollateral(telegramUserId: number): Promise<{ total: number; free: number; used: number; availableWithdraw: number }> {
     try {
-      const driftClient = await this.getDriftClientForUser(telegramUserId);
-      const userAccount = driftClient.getUserAccount();
+      // Get wallet address and fetch user account directly from chain
+      const walletAddress = await privyService.getWalletAddress(telegramUserId);
+      if (!walletAddress) {
+        return { total: 0, free: 0, used: 0, availableWithdraw: 0 };
+      }
+
+      const userPublicKey = new SolanaPublicKey(walletAddress);
+      const userAccount = await this.fetchUserAccountDirectly(userPublicKey, 0);
 
       if (!userAccount) {
         return { total: 0, free: 0, used: 0, availableWithdraw: 0 };
       }
 
-      // Get total collateral (simplified - just spot position values)
-      let totalCollateral = 0;
-      try {
-        const spotMarkets = driftClient.getSpotMarketAccounts();
-        for (const spotMarket of spotMarkets) {
-          const pos = userAccount.spotPositions.find((p: any) => p.marketIndex === spotMarket.marketIndex);
-          if (pos && pos.scaledBalance && !pos.scaledBalance.isZero()) {
-            const bal = convertToNumber(pos.scaledBalance, new BN(spotMarket.decimals));
-            totalCollateral += bal;
+      const driftClient = await this.getDriftClientForUser(telegramUserId);
+
+      // Calculate total collateral from spot positions (in USD) using SDK helper functions
+      let totalCollateralUSD = 0;
+      const spotMarkets = driftClient.getSpotMarketAccounts();
+
+      for (const spotMarket of spotMarkets) {
+        const position = userAccount.spotPositions.find((p: any) => p.marketIndex === spotMarket.marketIndex);
+        if (!position || position.scaledBalance.isZero()) continue;
+        if (position.balanceType !== undefined && !isVariant(position.balanceType, 'deposit')) continue;
+
+        try {
+          // Use getTokenAmount to get actual token amount (in token's native decimals)
+          const tokenAmountBN = getTokenAmount(
+            position.scaledBalance,
+            spotMarket,
+            position.balanceType || SpotBalanceType.DEPOSIT
+          );
+
+          // Use getTokenValue to get USD value (handles precision correctly)
+          const oracleData = driftClient.getOracleDataForSpotMarket(spotMarket.marketIndex);
+          if (oracleData && oracleData.price) {
+            // getTokenValue returns value in PRICE_PRECISION, need to convert to USD
+            const valueBN = getTokenValue(tokenAmountBN, spotMarket.decimals, oracleData);
+            const valueUSD = convertToNumber(valueBN, PRICE_PRECISION);
+            totalCollateralUSD += valueUSD;
+          } else {
+            // Fallback for markets without oracle
+            const tokenAmount = convertToNumber(tokenAmountBN, new BN(10).pow(new BN(spotMarket.decimals)));
+            if (spotMarket.marketIndex === QUOTE_SPOT_MARKET_INDEX || spotMarket.mint.equals(NATIVE_MINT) === false) {
+              // Assume USDC or quote market = 1:1
+              totalCollateralUSD += tokenAmount;
+            } else {
+              // SOL - try to get price from SOL-PERP
+              try {
+                const solOracle = driftClient.getOracleDataForPerpMarket(0);
+                if (solOracle) {
+                  const valueBN = getTokenValue(tokenAmountBN, spotMarket.decimals, solOracle);
+                  const valueUSD = convertToNumber(valueBN, PRICE_PRECISION);
+                  totalCollateralUSD += valueUSD;
+                } else {
+                  totalCollateralUSD += tokenAmount; // Fallback
+                }
+              } catch (e) {
+                totalCollateralUSD += tokenAmount; // Fallback
+              }
+            }
           }
+        } catch (e) {
+          console.warn(`Failed to calculate collateral for market ${spotMarket.marketIndex}:`, e);
         }
-      } catch (e) {
-        console.warn('Failed to calculate collateral:', e);
       }
 
-      // Estimate free collateral (simplified)
-      const freeCollateral = totalCollateral * 0.8; // Conservative estimate
-      const usedCollateral = totalCollateral - freeCollateral;
+      // Estimate free collateral (conservative: total - estimated margin requirements)
+      // This is a simplified calculation - for accuracy, would need User class methods
+      const freeCollateral = Math.max(0, totalCollateralUSD * 0.8); // Conservative 80% free
+      const usedCollateral = totalCollateralUSD - freeCollateral;
 
       return {
-        total: totalCollateral,
+        total: totalCollateralUSD,
         free: freeCollateral,
         used: usedCollateral,
         availableWithdraw: freeCollateral,
@@ -983,27 +1501,99 @@ export class DriftService {
 
   /**
    * Get user's spot positions (collateral breakdown by token)
+   * Returns positions with proper token names and USD values
    */
   async getSpotPositions(telegramUserId: number): Promise<any[]> {
     try {
-      const driftClient = await this.getDriftClientForUser(telegramUserId);
-      const userAccount = driftClient.getUserAccount();
+      // Get wallet address and fetch user account directly from chain
+      const walletAddress = await privyService.getWalletAddress(telegramUserId);
+      if (!walletAddress) {
+        return [];
+      }
+
+      const userPublicKey = new SolanaPublicKey(walletAddress);
+      const userAccount = await this.fetchUserAccountDirectly(userPublicKey, 0);
+      
       if (!userAccount) return [];
+
+      const driftClient = await this.getDriftClientForUser(telegramUserId);
 
       const positions: any[] = [];
       const spotMarkets = driftClient.getSpotMarketAccounts();
 
       for (const spotMarket of spotMarkets) {
         const position = userAccount.spotPositions.find((p: any) => p.marketIndex === spotMarket.marketIndex);
+        
+        // Skip if no position or zero balance
         if (!position || position.scaledBalance.isZero()) continue;
+        
+        // Skip borrows, only show deposits
+        if (position.balanceType !== undefined && !isVariant(position.balanceType, 'deposit')) continue;
 
-        const balance = convertToNumber(position.scaledBalance, new BN(spotMarket.decimals));
+        // Convert scaled balance to actual token amount using SDK helper
+        const balanceBN = getTokenAmount(
+          position.scaledBalance,
+          spotMarket,
+          position.balanceType || SpotBalanceType.DEPOSIT
+        );
+        // getTokenAmount returns balance in base units (smallest unit)
+        const balance = convertToNumber(balanceBN, new BN(10).pow(new BN(spotMarket.decimals)));
+
+        // Decode token name properly
+        let symbol = `SPOT-${spotMarket.marketIndex}`;
+        try {
+          const decodedName = decodeName(spotMarket.name).trim();
+          if (decodedName) {
+            symbol = decodedName.replace('-SPOT', '').toUpperCase();
+          }
+        } catch (e) {
+          console.warn(`Failed to decode name for market ${spotMarket.marketIndex}:`, e);
+        }
+
+        // Get oracle price for USD conversion using SDK helper
+        let valueUsd = 0;
+        try {
+          const oracleData = driftClient.getOracleDataForSpotMarket(spotMarket.marketIndex);
+          if (oracleData && oracleData.price) {
+            // Use getTokenValue to get USD value (handles precision correctly)
+            const valueBN = getTokenValue(balanceBN, spotMarket.decimals, oracleData);
+            valueUsd = convertToNumber(valueBN, PRICE_PRECISION);
+          } else {
+            // Fallback: if USDC/quote market, price is 1; if SOL, use SOL-PERP price
+            if (spotMarket.marketIndex === QUOTE_SPOT_MARKET_INDEX || symbol === 'USDC' || symbol.includes('USDC')) {
+              valueUsd = balance; // USDC = 1:1 with USD
+            } else if (spotMarket.mint.equals(NATIVE_MINT) || symbol === 'SOL') {
+              // Try to get SOL price from SOL-PERP oracle
+              try {
+                const solOracle = driftClient.getOracleDataForPerpMarket(0);
+                if (solOracle) {
+                  const valueBN = getTokenValue(balanceBN, spotMarket.decimals, solOracle);
+                  valueUsd = convertToNumber(valueBN, PRICE_PRECISION);
+                } else {
+                  valueUsd = balance; // Fallback
+                }
+              } catch (e) {
+                valueUsd = balance; // Fallback
+              }
+            } else {
+              valueUsd = balance; // Fallback: assume 1:1 if we can't get price
+            }
+          }
+        } catch (e) {
+          console.warn(`Failed to get price for ${symbol}:`, e);
+          // Fallback: assume quote market or use balance as placeholder
+          if (spotMarket.marketIndex === QUOTE_SPOT_MARKET_INDEX) {
+            valueUsd = balance;
+          } else {
+            valueUsd = balance; // Placeholder
+          }
+        }
 
         positions.push({
-          symbol: spotMarket.name || `SPOT-${spotMarket.marketIndex}`,
+          symbol: symbol,
           marketIndex: spotMarket.marketIndex,
           balance: balance,
-          value: balance, // Multiply by token price if needed
+          valueUsd: valueUsd,
         });
       }
 

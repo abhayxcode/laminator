@@ -51,6 +51,9 @@ export class DEXManager {
   private driftService: DriftService;
   private jupiterService: JupiterService;
   private initialized: boolean = false;
+  private marketsCache: Map<string, UnifiedMarket[]> = new Map();
+  private marketsCacheTime: Map<string, number> = new Map();
+  private readonly CACHE_DURATION = 5 * 60 * 1000; // 5 minutes
 
   constructor() {
     this.driftService = new DriftService();
@@ -144,9 +147,22 @@ export class DEXManager {
     if (!this.initialized) {
       throw new Error('DEX Manager not initialized');
     }
+
+    const dexIdLower = dexId.toLowerCase();
+
+    // Check cache first
+    const now = Date.now();
+    const cachedMarkets = this.marketsCache.get(dexIdLower);
+    const cacheTime = this.marketsCacheTime.get(dexIdLower) || 0;
+
+    if (cachedMarkets && (now - cacheTime) < this.CACHE_DURATION) {
+      console.log(`📦 Using cached markets for ${dexId} (${cachedMarkets.length} markets, age: ${Math.floor((now - cacheTime) / 1000)}s)`);
+      return cachedMarkets;
+    }
+
     try {
       let markets: any[] = [];
-      switch (dexId.toLowerCase()) {
+      switch (dexIdLower) {
         case 'drift':
           console.log('📊 Fetching Drift Protocol markets...');
           const driftMarkets = await this.driftService.getAvailableMarkets();
@@ -191,10 +207,22 @@ export class DEXManager {
         default:
           throw new Error(`Unknown DEX: ${dexId}`);
       }
-      console.log(`✅ Found ${markets.length} markets for ${dexId}`);
+
+      // Cache the results
+      this.marketsCache.set(dexIdLower, markets);
+      this.marketsCacheTime.set(dexIdLower, now);
+
+      console.log(`✅ Fetched and cached ${markets.length} markets for ${dexId}`);
       return markets;
     } catch (error) {
       console.error(`❌ Failed to get markets for ${dexId}:`, error);
+
+      // If we have stale cache, return it
+      if (cachedMarkets) {
+        console.warn(`⚠️ Returning stale cached markets for ${dexId} due to error`);
+        return cachedMarkets;
+      }
+
       throw error;
     }
   }

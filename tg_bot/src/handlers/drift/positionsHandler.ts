@@ -55,7 +55,7 @@ async function showPositionList(
 
     // Convert to DriftPositionInfo format
     const positions: DriftPositionInfo[] = rawPositions.map((p: any) => ({
-      marketIndex: 0, // We'll need to extract this from the symbol
+      marketIndex: p.marketIndex,
       symbol: p.symbol,
       direction: p.side as 'long' | 'short',
       size: p.size,

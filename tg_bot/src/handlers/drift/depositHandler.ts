@@ -1,20 +1,31 @@
 /**
  * Drift Deposit Handler
- * Handles deposit flow with account initialization check
+ * Handles deposit flow with Privy wallet creation and database tracking
  */
 
 import TelegramBot from 'node-telegram-bot-api';
 import { SubAction, SessionFlow } from '../../types/telegram.types';
 import { safeEditMessage } from '../callbackQueryRouter';
-import { buildDepositTokenKeyboard, buildDriftMainKeyboard, buildConfirmationKeyboard } from '../../keyboards/driftKeyboards';
+import { buildDepositTokenKeyboard, buildDriftMainKeyboard, buildWalletCreationKeyboard, buildWalletStatusKeyboard } from '../../keyboards/driftKeyboards';
 import { sessionManager } from '../../state/userSessionManager';
 import { driftService } from '../../services/driftService';
 import { createDriftTransactionService } from '../../services/driftTransactionService';
 import { privySigningService } from '../../services/privySigningService';
 import { databaseService } from '../../services/databaseService';
-import { PublicKey } from '@solana/web3.js';
-import { getAssociatedTokenAddressSync } from '@solana/spl-token';
-import { SpotMarkets, BN } from '@drift-labs/sdk';
+import { driftDatabaseService } from '../../services/driftDatabaseService';
+import { privyService } from '../../services/privyService';
+import { hasFundedWallet } from '../walletHandler';
+import { PublicKey, LAMPORTS_PER_SOL } from '@solana/web3.js';
+import { getAssociatedTokenAddressSync, NATIVE_MINT } from '@solana/spl-token';
+import { BN, MarketType } from '@drift-labs/sdk';
+
+// Token configurations
+// Note: marketIndex is fetched directly from Drift client's spot market accounts
+const DEPOSIT_TOKENS = [
+  { symbol: 'USDC', decimals: 6 },
+  { symbol: 'SOL', decimals: 9 },
+  { symbol: 'USDT', decimals: 6 }
+];
 
 /**
  * Handle deposit action
@@ -67,6 +78,50 @@ async function startDepositFlow(
   messageId: number,
   userId: string
 ): Promise<void> {
+  // Check if user has wallet
+  const walletStatus = await hasFundedWallet(chatId);
+  
+  if (!walletStatus.hasWallet) {
+    // No wallet - show creation option
+    await safeEditMessage(
+      bot,
+      chatId,
+      messageId,
+      `*❌ No Wallet Found*\n\n` +
+      `You need to create a Privy wallet first before you can deposit.\n\n` +
+      `Click "Create Wallet" below to get started:`,
+      {
+        reply_markup: {
+          inline_keyboard: buildWalletCreationKeyboard(),
+        },
+      }
+    );
+    return;
+  }
+
+  if (!walletStatus.isFunded) {
+    // Wallet exists but not funded - show funding message
+    const balance = walletStatus.balance || 0;
+    await safeEditMessage(
+      bot,
+      chatId,
+      messageId,
+      `*⚠️ Wallet Not Funded*\n\n` +
+      `Your wallet balance: **${balance.toFixed(9)} SOL**\n\n` +
+      `Please fund your wallet with at least **0.001 SOL** before depositing.\n\n` +
+      `**Your Wallet Address:**\n` +
+      `\`${walletStatus.wallet?.walletAddress}\`\n\n` +
+      `Send SOL to this address, then click "Check Balance" to verify.`,
+      {
+        reply_markup: {
+          inline_keyboard: buildWalletStatusKeyboard(false),
+        },
+      }
+    );
+    return;
+  }
+
+  // Wallet exists and funded - proceed with deposit
   sessionManager.startFlow(userId, chatId, SessionFlow.DEPOSIT);
 
   const keyboard = buildDepositTokenKeyboard();
@@ -95,18 +150,19 @@ async function handleTokenSelection(
   userId: string,
   tokenIndex: number
 ): Promise<void> {
-  const tokenNames = ['USDC', 'SOL', 'USDT'];
-  const tokenName = tokenNames[tokenIndex] || 'Unknown';
-
-  sessionManager.updateData(userId, { depositToken: tokenIndex });
+  const token = DEPOSIT_TOKENS[tokenIndex];
+  
+  sessionManager.updateData(userId, { 
+    depositToken: tokenIndex
+  });
 
   await safeEditMessage(
     bot,
     chatId,
     messageId,
-    `*💰 Deposit ${tokenName} to Drift*\n\n` +
+    `*💰 Deposit ${token.symbol} to Drift*\n\n` +
     `Please reply with the amount you want to deposit.\n\n` +
-    `Example: \`100\` for 100 ${tokenName}\n\n` +
+    `Example: \`100\` for 100 ${token.symbol}\n\n` +
     `Your message will be captured automatically.`,
     {
       reply_markup: {
@@ -151,19 +207,18 @@ async function showDepositConfirmation(
   tokenIndex: number,
   amount: number
 ): Promise<void> {
-  const tokenNames = ['USDC', 'SOL', 'USDT'];
-  const tokenName = tokenNames[tokenIndex];
+  const token = DEPOSIT_TOKENS[tokenIndex];
 
   const message =
     `*💰 Confirm Deposit*\n\n` +
-    `Token: **${tokenName}**\n` +
-    `Amount: **${amount} ${tokenName}**\n` +
+    `Token: **${token.symbol}**\n` +
+    `Amount: **${amount} ${token.symbol}**\n` +
     `Destination: **Drift Protocol**\n\n` +
-    `⚠️ **Important:**\n` +
-    `• Transaction will be signed with your Privy wallet\n` +
-    `• Funds will be deposited to your Drift account\n` +
-    `• You can withdraw anytime\n\n` +
-    `Tap **Confirm** to proceed.`;
+    `⚠️ **First-time users:**\n` +
+    `• We'll create your Privy wallet automatically\n` +
+    `• Drift account will be initialized (if needed)\n` +
+    `• You'll have full control via Telegram\n\n` +
+    `Ready to proceed?`;
 
   const keyboard = [
     [
@@ -189,99 +244,250 @@ async function executeDeposit(
   amount: number
 ): Promise<void> {
   try {
-    await bot.sendMessage(chatId, '⏳ Building transaction...');
-
-    // Get user from database
-    const dbUser = await databaseService.getUserByTelegramId(chatId);
-    if (!dbUser || !dbUser.wallets || dbUser.wallets.length === 0) {
-      throw new Error('User wallet not found');
+    const token = DEPOSIT_TOKENS[tokenIndex];
+    
+    // Step 1: Check wallet exists and is funded
+    const walletStatus = await hasFundedWallet(chatId);
+    
+    if (!walletStatus.hasWallet) {
+      await bot.sendMessage(
+        chatId,
+        `❌ **No Wallet Found**\n\nPlease create a wallet first.`,
+        { parse_mode: 'Markdown', reply_markup: { inline_keyboard: buildWalletCreationKeyboard() } }
+      );
+      return;
     }
 
-    const wallet = dbUser.wallets.find((w: any) => w.blockchain === 'SOLANA');
-    if (!wallet) {
-      throw new Error('Solana wallet not found');
+    if (!walletStatus.isFunded) {
+      const balance = walletStatus.balance || 0;
+      await bot.sendMessage(
+        chatId,
+        `⚠️ **Wallet Not Funded**\n\n` +
+        `Your balance: **${balance.toFixed(9)} SOL**\n\n` +
+        `Please fund your wallet with at least **0.001 SOL** before depositing.\n\n` +
+        `**Wallet Address:**\n\`${walletStatus.wallet?.walletAddress}\``,
+        { parse_mode: 'Markdown', reply_markup: { inline_keyboard: buildWalletStatusKeyboard(false) } }
+      );
+      return;
     }
-
+    
+    // Get user and wallet from database
+    const user = await databaseService.getUserByTelegramId(chatId);
+    if (!user || !walletStatus.wallet) {
+      throw new Error('User or wallet not found');
+    }
+    
+    const wallet = walletStatus.wallet;
+    
     const userPublicKey = new PublicKey(wallet.walletAddress);
-
-    // Get spot market info for the token
-    const spotMarkets = SpotMarkets['mainnet-beta'];
-    const marketIndex = tokenIndex; // Simplified - USDC=0, SOL=1, etc.
-    const spotMarket = spotMarkets[marketIndex];
-
-    if (!spotMarket) {
-      throw new Error('Spot market not found');
-    }
-
-    // Convert amount to BN with proper precision
-    const decimals = spotMarket.precisionExp.toNumber();
-    const amountBN = new BN(amount * Math.pow(10, decimals));
-
-    // Get token mint and account
-    const tokenMint = new PublicKey(spotMarket.mint);
-    const tokenAccount = getAssociatedTokenAddressSync(tokenMint, userPublicKey);
-
-    // Check if user has Drift account initialized
+    
+    // Step 2: Check if Drift account exists
+    await bot.sendMessage(chatId, '🔍 Checking Drift account...');
+    
     const hasAccount = await driftService.hasUserAccount(userPublicKey);
-
-    // Get Drift client
+    
+    // Step 3: Get Drift client and find spot market from actual accounts
+    await bot.sendMessage(chatId, '⏳ Building transaction...');
+    
     const driftClient = await (driftService as any).getDriftClientForMarketData();
-    if (!driftClient) {
-      throw new Error('Drift client not available');
+    if (!driftClient) throw new Error('Drift client unavailable');
+    
+    // Get actual spot market accounts from Drift client
+    // Use getMarketIndexAndType if available, otherwise find manually
+    const spotMarketAccounts = driftClient.getSpotMarketAccounts();
+    
+    // Try using getMarketIndexAndType (handles name decoding)
+    let marketInfo = driftClient.getMarketIndexAndType(token.symbol) ||
+                     driftClient.getMarketIndexAndType(`${token.symbol}-SPOT`);
+    
+    let spotMarketAccount;
+    if (marketInfo && marketInfo.marketType === MarketType.SPOT) {
+      spotMarketAccount = driftClient.getSpotMarketAccount(marketInfo.marketIndex);
     }
-
-    const txService = createDriftTransactionService(driftClient);
-
-    // Build appropriate transaction
-    let tx;
+    
+    // Fallback: find by iterating through spot markets
+    if (!spotMarketAccount) {
+      // For SOL, find by native mint
+      if (token.symbol === 'SOL') {
+        spotMarketAccount = spotMarketAccounts.find((market: any) => 
+          market.mint.equals(NATIVE_MINT)
+        );
+      }
+      
+      // If still not found, try matching by market name
+      if (!spotMarketAccount) {
+        const { decodeName } = await import('@drift-labs/sdk');
+        spotMarketAccount = spotMarketAccounts.find((market: any) => {
+          const marketName = decodeName(market.name).trim();
+          return marketName === token.symbol || marketName === `${token.symbol}-SPOT`;
+        });
+      }
+    }
+    
+    if (!spotMarketAccount) {
+      const { decodeName } = await import('@drift-labs/sdk');
+      const availableMarkets = spotMarketAccounts.map((m: any) => {
+        const name = decodeName(m.name).trim() || `SPOT-${m.marketIndex}`;
+        return `${name} (index: ${m.marketIndex})`;
+      }).join(', ');
+      throw new Error(`Spot market not found for ${token.symbol}. Available markets: ${availableMarkets}`);
+    }
+    
+    const actualMarketIndex = spotMarketAccount.marketIndex;
+    const marketTokenMint = spotMarketAccount.mint;
+    const tokenAccount = getAssociatedTokenAddressSync(marketTokenMint, userPublicKey);
+    
+    const connection = (driftService as any).connection;
+    const txService = createDriftTransactionService(driftClient, connection);
+    
+    const amountBN = new BN(amount * Math.pow(10, token.decimals));
+    
+    let transaction;
+    
     if (!hasAccount) {
-      await bot.sendMessage(chatId, '🔧 Initializing Drift account...');
-      tx = await txService.buildInitAndDepositTransaction(
+      await bot.sendMessage(chatId, '🆕 Initializing Drift account...');
+      transaction = await txService.buildInitAndDepositTransaction(
         userPublicKey,
         amountBN,
-        marketIndex,
-        tokenMint
+        actualMarketIndex,
+        marketTokenMint
       );
     } else {
-      tx = await txService.buildDepositOnlyTransaction(
+      transaction = await txService.buildDepositOnlyTransaction(
         userPublicKey,
         amountBN,
-        marketIndex,
-        tokenMint
+        actualMarketIndex,
+        marketTokenMint
       );
     }
-
+    
+    // Step 5: Create transaction record
+    const txRecord = await driftDatabaseService.createTransaction({
+      userId: user.id,
+      walletId: wallet.id,
+      txType: 'DEPOSIT',
+      status: 'PENDING',
+      amount: amount.toString(),
+      tokenSymbol: token.symbol,
+      marketIndex: actualMarketIndex,
+      metadata: {
+        hasAccount,
+        requiresInit: !hasAccount
+      }
+    });
+    
+    // Step 6: Sign and submit with retry
     await bot.sendMessage(chatId, '🔐 Signing with Privy...');
-
-    // Sign and send with Privy
-    const signature = await privySigningService.signAndSendTransaction(
+    
+    const signature = await privySigningService.signAndSendTransactionWithRetry(
       chatId,
-      tx,
-      (driftService as any).connection
+      transaction,
+      (driftService as any).connection,
+      {
+        onRetry: async (attempt) => {
+          await driftDatabaseService.updateTransaction(txRecord.id, {
+            retryCount: attempt
+          });
+        }
+      }
     );
-
-    // Clear session
+    
+    // Step 7: Update transaction record
+    await driftDatabaseService.updateTransaction(txRecord.id, {
+      status: 'CONFIRMED',
+      txHash: signature,
+      confirmedAt: new Date()
+    });
+    
+    // Step 8: Update wallet balance
+    await databaseService.updateBalance({
+      walletId: wallet.id,
+      tokenSymbol: token.symbol,
+      balance: amount
+    });
+    
+    // Step 9: Clear session
     sessionManager.clearFlow(userId);
-
-    // Send success message
-    const tokenNames = ['USDC', 'SOL', 'USDT'];
+    
+    // Step 10: Success message
     const explorerUrl = `https://solscan.io/tx/${signature}`;
     await bot.sendMessage(
       chatId,
       `✅ **Deposit Successful!**\n\n` +
-      `Deposited: **${amount} ${tokenNames[tokenIndex]}**\n\n` +
-      `[View on Explorer](${explorerUrl})`,
-      { parse_mode: 'Markdown' }
+      `Amount: **${amount} ${token.symbol}**\n` +
+      `Destination: **Drift Protocol**\n\n` +
+      `[View Transaction](${explorerUrl})`,
+      {
+        parse_mode: 'Markdown',
+        reply_markup: {
+          inline_keyboard: buildDriftMainKeyboard(),
+        },
+      }
     );
 
   } catch (error) {
     console.error('Deposit error:', error);
+    
     sessionManager.clearFlow(userId);
-    await bot.sendMessage(
-      chatId,
-      `❌ **Deposit Failed**\n\n` +
-      `Error: ${(error as Error).message}\n\n` +
-      `Please try again or contact support.`
-    );
+    
+    const userMessage = getUserFriendlyErrorMessage(error);
+    await bot.sendMessage(chatId, `❌ **Deposit Failed**\n\n${userMessage}`);
+  }
+}
+
+/**
+ * Gets user and wallet (no auto-creation)
+ * Used internally after wallet existence is verified
+ */
+async function getUserAndWallet(telegramUserId: number): Promise<{
+  user: any;
+  wallet: any;
+} | null> {
+  // Get user
+  const user = await databaseService.getUserByTelegramId(telegramUserId);
+  
+  if (!user) {
+    return null;
+  }
+  
+  // Find Privy wallet
+  const wallet = user.wallets?.find((w: any) => w.chainType === 'SOLANA' && w.walletType === 'PRIVY');
+  
+  if (!wallet) {
+    return null;
+  }
+  
+  return { user, wallet };
+}
+
+// Error handling utilities
+function classifyError(error: any): string {
+  const msg = error?.message?.toLowerCase() || '';
+  
+  if (msg.includes('insufficient')) return 'INSUFFICIENT_BALANCE';
+  if (msg.includes('timeout')) return 'TIMEOUT';
+  if (msg.includes('network')) return 'NETWORK_ERROR';
+  if (msg.includes('rpc')) return 'RPC_ERROR';
+  if (msg.includes('privy')) return 'PRIVY_ERROR';
+  
+  return 'UNKNOWN';
+}
+
+function getUserFriendlyErrorMessage(error: any): string {
+  const errorType = classifyError(error);
+  
+  switch (errorType) {
+    case 'INSUFFICIENT_BALANCE':
+      return 'Insufficient balance in your wallet. Please add funds first.';
+    case 'TIMEOUT':
+      return 'Transaction timeout. Check Solscan for status.';
+    case 'NETWORK_ERROR':
+      return 'Network error. Please try again.';
+    case 'RPC_ERROR':
+      return 'Solana network congested. Please try again.';
+    case 'PRIVY_ERROR':
+      return 'Wallet service error. Please contact support.';
+    default:
+      return `Error: ${(error as Error).message}`;
   }
 }

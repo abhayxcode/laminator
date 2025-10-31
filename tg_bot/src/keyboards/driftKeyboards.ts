@@ -458,3 +458,81 @@ export function buildOrderbookMarketKeyboard(markets: DriftMarketInfo[]): Inline
     )
   );
 }
+
+/**
+ * Orderbook view keyboard (with refresh)
+ */
+export function buildOrderbookKeyboard(marketIndex: number): InlineKeyboard {
+  const { button, row, keyboard } = KeyboardButtonBuilder;
+
+  return keyboard(
+    row(
+      button(
+        '🔄 Refresh',
+        new CallbackDataBuilder(CallbackPrefix.DRIFT, DriftAction.ORDERBOOK)
+          .add(SubAction.SELECT_MARKET)
+          .add(marketIndex)
+          .build()
+      ),
+      button(
+        '📊 Markets',
+        new CallbackDataBuilder(CallbackPrefix.DRIFT, DriftAction.MARKETS).build()
+      )
+    ),
+    row(
+      button('🔙 Back', new CallbackDataBuilder(CallbackPrefix.DRIFT, DriftAction.REFRESH).build())
+    )
+  );
+}
+
+/**
+ * Wallet creation keyboard (shown when user has no wallet)
+ */
+export function buildWalletCreationKeyboard(): InlineKeyboard {
+  const { button, row, keyboard } = KeyboardButtonBuilder;
+
+  return keyboard(
+    row(
+      button(
+        '🔐 Create Wallet',
+        new CallbackDataBuilder(CallbackPrefix.DRIFT, DriftAction.WALLET).build()
+      )
+    ),
+    row(
+      button('🔙 Back', new CallbackDataBuilder(CallbackPrefix.DRIFT, DriftAction.REFRESH).build())
+    )
+  );
+}
+
+/**
+ * Wallet status keyboard (shown when user has wallet but not funded)
+ */
+export function buildWalletStatusKeyboard(hasFunds: boolean = false): InlineKeyboard {
+  const { button, row, keyboard } = KeyboardButtonBuilder;
+
+  if (hasFunds) {
+    return keyboard(
+      row(
+        button('💰 Deposit', new CallbackDataBuilder(CallbackPrefix.DRIFT, DriftAction.DEPOSIT).build()),
+        button('📊 Markets', new CallbackDataBuilder(CallbackPrefix.DRIFT, DriftAction.MARKETS).build())
+      ),
+      row(
+        button('🔄 Check Balance', new CallbackDataBuilder(CallbackPrefix.DRIFT, DriftAction.WALLET).add('check').build()),
+        button('💼 Wallet', new CallbackDataBuilder(CallbackPrefix.DRIFT, DriftAction.WALLET).build())
+      ),
+      row(
+        button('🔙 Back', new CallbackDataBuilder(CallbackPrefix.DRIFT, DriftAction.REFRESH).build())
+      )
+    );
+  }
+
+  return keyboard(
+    row(
+      button('🔄 Check Balance', new CallbackDataBuilder(CallbackPrefix.DRIFT, DriftAction.WALLET).add('check').build()),
+      button('💼 Wallet', new CallbackDataBuilder(CallbackPrefix.DRIFT, DriftAction.WALLET).build())
+    ),
+    row(
+      button('🔙 Back', new CallbackDataBuilder(CallbackPrefix.DRIFT, DriftAction.REFRESH).build())
+    )
+  );
+}
