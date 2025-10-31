@@ -1,0 +1,40 @@
+name: Docker Continuous Deployment
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build_and_deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v2
+        with:
+          context: .
+          file: ./tg_bot/Dockerfile
+          push: true
+          tags: abhayxcode/laminator:latest
+
+      - name: Deploy to EC2
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USERNAME }}
+          key: ${{ secrets.SSH_KEY }}
+          script: |
+            sudo docker pull abhayxcode/laminator:latest
+            sudo docker stop laminator || true
+            sudo docker rm laminator || true
+            sudo docker run -d --restart always --name laminator --env-file tg_bot/.env -p 8000:8000 abhayxcode/laminator:latest
+            sudo docker image prune -f
