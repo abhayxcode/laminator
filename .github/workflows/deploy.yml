@@ -21,8 +21,8 @@ jobs:
       - name: Build and push Docker image
         uses: docker/build-push-action@v2
         with:
-          context: .
-          file: ./tg_bot/Dockerfile
+          context: tg_bot
+          file: tg_bot/Dockerfile
           push: true
           tags: abhayxcode/laminator:latest
 
@@ -36,5 +36,5 @@ jobs:
             sudo docker pull abhayxcode/laminator:latest
             sudo docker stop laminator || true
             sudo docker rm laminator || true
-            sudo docker run -d --restart always --name laminator --env-file tg_bot/.env -p 8000:8000 abhayxcode/laminator:latest
+            sudo docker run -d --restart always --name laminator --env-file .env -p 8000:8000 abhayxcode/laminator:latest
             sudo docker image prune -f
